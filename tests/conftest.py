@@ -1,16 +1,17 @@
 """Pytest configuration and shared fixtures."""
 from __future__ import annotations
 
-import os
-import tempfile
+import sys
 from pathlib import Path
 
 import pytest
 
-# Make the src package importable when running tests directly
+# Make the src package importable when running tests directly without an
+# editable install. ``sys.path`` is the canonical location for this —
+# ``os.sys.path`` works only as an alias and obscures the intent.
 SRC = Path(__file__).parent.parent / "src"
-if str(SRC) not in os.sys.path:
-    os.sys.path.insert(0, str(SRC))
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 
 @pytest.fixture

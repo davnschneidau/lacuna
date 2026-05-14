@@ -21,14 +21,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
-from lacuna.kg import open_kg  # noqa: E402
+from lacuna.kg import open_kg
 
 # Destructive HTTP verbs that require explicit allow-listing
 DESTRUCTIVE_HTTP_VERBS = {"PUT", "PATCH", "DELETE"}
-
-# In-memory rate limiter (process-local; one PreToolUse process invocation
-# per tool call so this only catches bursts within a single hook invocation)
-_LAST_REQUEST_TS: dict[str, float] = {}
 
 
 def _parse_manifest_dast_safety() -> dict:
@@ -94,14 +90,25 @@ def main() -> int:
             else:
                 decision = _allow()
 
-            # Rate limit per target (only if allowed so far)
+            # Rate limit per target. The previous implementation used a
+            # process-local ``_LAST_REQUEST_TS`` dict, which doesn't
+            # survive across hook invocations — Claude Code starts a new
+            # PreToolUse subprocess per tool call, so the rate limit was
+            # effectively unbounded. Persist the call ledger in the KG
+            # instead and sum requests over a rolling 1-second window.
             if decision["decision"] == "allow":
                 target = tool_args.get("url", "global")
-                last = _LAST_REQUEST_TS.get(target, 0)
-                min_interval = 1.0 / max(rate_limit_rps, 0.1)
-                if time.time() - last < min_interval:
-                    time.sleep(min_interval - (time.time() - last))
-                _LAST_REQUEST_TS[target] = time.time()
+                rate_limit_rps = max(rate_limit_rps, 0.1)
+                window_s = 1.0
+                # Each row is a single call; one second of headroom is
+                # plenty to detect bursts that exceed the rate limit.
+                kg.record_hook_tool_call(agent, f"dast:{target}")
+                recent = kg.count_hook_tool_calls(
+                    agent, window_seconds=int(window_s),
+                )
+                if recent > rate_limit_rps:
+                    sleep_for = window_s
+                    time.sleep(sleep_for)
 
         # ── 3. Recon and KG tools: always allowed ───────────────────────────
         else:

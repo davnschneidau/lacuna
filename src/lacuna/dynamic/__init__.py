@@ -13,11 +13,14 @@ Modules:
 
 All oracles return the same envelope: {summary, status, findings|crashes|...}
 """
-from .sanitizer_build import build as sanitizer_build
-from .fuzzer import fuzz_function
-from .symex import symex_reach
 from .differential import differential_parse
+from .fuzzer import fuzz_function
+from .sanitizer_build import build as sanitizer_build
+from .symex import symex_reach
 
 __all__ = [
-    "sanitizer_build", "fuzz_function", "symex_reach", "differential_parse",
+    "differential_parse",
+    "fuzz_function",
+    "sanitizer_build",
+    "symex_reach",
 ]

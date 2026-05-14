@@ -4,7 +4,7 @@ description: |
   Lightweight classifier that runs after each hunter batch to deduplicate,
   cluster, and prioritize hypotheses before validation. Cheap; uses Haiku.
   Optional — the orchestrator may skip when hypothesis volume is low.
-model: ${LACUNA_MODEL_HAIKU}
+model: ${LACUNA_MODEL_HAIKU:-claude-haiku-4-5}
 tools:
   - mcp__lacuna-kg__kg.read.hypotheses
   - mcp__lacuna-kg__kg.write.update_hypothesis_status

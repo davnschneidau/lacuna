@@ -1,7 +1,7 @@
 """Tests for the KG client."""
 from __future__ import annotations
 
-from lacuna.kg import Chain, Finding, Hypothesis, Primitive
+from lacuna.kg import Finding, Hypothesis, Primitive
 
 
 def test_initialize_creates_all_tables(tmp_kg):
@@ -12,11 +12,17 @@ def test_initialize_creates_all_tables(tmp_kg):
     table_names = {r["name"] for r in rows}
     expected = {
         "event_log", "application_model", "hypotheses", "findings",
-        "evidence", "primitives", "chain_candidates", "chains",
+        "evidence", "primitives", "chains",
         "exit_criteria", "tool_audit", "agent_notes",
         "orchestrator_state", "scan_meta",
     }
-    assert expected.issubset(table_names)
+    assert expected.issubset(table_names), (
+        f"missing: {expected - table_names}"
+    )
+    assert "chain_candidates" not in table_names, (
+        "chain_candidates was dropped in v3.0; chain drafts now live as "
+        "observations(kind=chain_candidate_draft)"
+    )
 
 
 def test_exit_criteria_seeded(tmp_kg):

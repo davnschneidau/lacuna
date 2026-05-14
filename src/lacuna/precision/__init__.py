@@ -22,16 +22,16 @@ All analyzers are pure-Python on top of the v2 flow engine (tree-sitter
 for. They will catch the long tail of obvious bugs cheaply.
 """
 
+from .allocator_map import analyze as analyze_allocator_map
+from .format_string import analyze as analyze_format_string
 from .integer_range import analyze as analyze_integer_range
 from .lifetime import analyze as analyze_lifetime
-from .format_string import analyze as analyze_format_string
 from .type_confusion import analyze as analyze_type_confusion
-from .allocator_map import analyze as analyze_allocator_map
 
 __all__ = [
+    "analyze_allocator_map",
+    "analyze_format_string",
     "analyze_integer_range",
     "analyze_lifetime",
-    "analyze_format_string",
     "analyze_type_confusion",
-    "analyze_allocator_map",
 ]

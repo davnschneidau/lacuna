@@ -1,39 +1,125 @@
-Idea 1: Maybe could connect into the bitbucket MCP so that the agent could read from the diffs and past stuff as well?
-Idea 2: OAuth/SSO specialist agent. OAuth and OIDC produce a steady stream of CVEs (mix-up attacks, redirect_uri smuggling, PKCE downgrade, ID-token confusion, JWKS cache poisoning). A dedicated agent with the full RFC 6749/6750/7636/8252 lore in its skill, plus probes for state/nonce binding, would find chains in any app with a third-party login button. Composes with trust-shadow: the OAuth specialist tells you who can mint what, trust-shadow tells you who trusts whom.
-Idea 3: SAML specialist agent. XML signature wrapping, XSW1-7, IdP/SP confusion, signature exclusion, comment injection on assertions, RelayState manipulation. The bug class is small but each instance is catastrophic. A specialist with the XSW pattern catalog and a SAMLRaider-equivalent tool surface would catch what generic auth hunters miss.
-Idea 4: SSRF deep specialist. Generic injection hunters find the SSRF; this agent figures out what to DO with it. DNS rebinding, parser-discrepancy SSRF (the Python urllib vs requests quirks), redirect-chain bypass, protocol smuggling, blind SSRF via timing/error-message oracle, IPv6 confusion, IDN homoglyph hosts. Pairs with the gopherus oracle.
-Idea 5: Race condition deep specialist. The single-packet attack (TCP last-byte sync), session-state TOCTOU, database row-locking gaps, distributed-lock failures, cache-stampede windows. Most hunters wave at "looks racy" — this one runs targeted concurrent-request bursts via the DAST harness and confirms via state divergence.
-Idea 6: Mass-assignment / hydrated-model specialist. Rails strong_params, Django ModelForm, Pydantic model_config, Hibernate setters. The bug is binding-level: which fields can a request reach? A specialist that diffs the field set of "client-facing DTO" against "ORM model" and flags every drift would find IDOR/privesc bugs that pattern matchers miss.
-Idea 7: IDOR matrix specialist. Crawls every authenticated endpoint as user A, then re-issues each with user B's resource IDs. Cross-product: every endpoint × every object the lower-privileged user shouldn't see. Generates a matrix of (endpoint, object_id, user_a_status, user_b_status) and flags rows where user_b gets non-404, non-403.
-Idea 8: XXE / XML specialist. Entity expansion, parameter entities, billion-laughs, OOB XXE via DTD, XPath injection, XML schema validation bypass. The shape is rare enough that generic hunters miss it; the impact when present is high. Knows which parsers ship with what defaults (lxml ≤ 4.x's resolve_entities default, Java's XMLInputFactory quirks).
-Idea 9: File upload polyglot specialist. PHP-in-GIF, SVG-with-JS, ZIP slip, polyglot PDFs with embedded JS, content-type sniff confusion. Has a payload generator that produces files which parse as both attack-X and as benign-Y, then walks every upload endpoint with each.
-Idea 10: NoSQL injection specialist. MongoDB operator injection ({"$ne": null}), Redis CONFIG/EVAL, Elasticsearch query DSL injection, CouchDB function injection. Generic injection patterns miss these because the syntax doesn't look like SQL.
-Idea 11: GraphQL specialist. Introspection enumeration even when explicitly disabled (field suggestions leak schema), nested-query depth/aliasing DoS, batch-query rate-limit bypass, mutation-vs-query authz drift (apps often only auth-check Query type), persisted-query injection. Big surface, weakly defended.
-Idea 12: WebSocket / SSE specialist. Cross-Site WebSocket Hijacking (origin check missing), authorization-on-connect-only (every message after is unchecked), state-machine bypass via out-of-order messages, ping-pong abuse for connection persistence past token expiry.
-Idea 13: Build-system / CI specialist. Workflow pull_request_target misuse, third-party action pin-by-tag-not-SHA, secret-in-logs from set-output, cache-poisoning via build artifacts, dependency-confusion ranges, Dockerfile ADD from remote URL. Adjacent to but distinct from iac_scan. Pairs with the gadget catalog.
-Idea 14: Privacy / PII data-flow specialist. Not a security agent in the classic sense — a data-flow agent specifically asking "where does PII land?" Outputs a PII map: every endpoint that emits an email/SSN/name/PCI field, every log line that writes one, every third-party request that includes one. Compliance gold.
-Mythos-tier tools and oracles
-Idea 15: JS bundle / sourcemap analyzer. Extracts API endpoints, embedded secrets, feature flags, internal route tables, and admin-only views from production JS bundles and accidentally-shipped sourcemaps. Many "hidden" admin endpoints aren't hidden at all to anyone who runs webpack's chunks through this.
-Idea 16: Wayback / archive shadow-surface miner. Pulls historical URL list from Wayback Machine, CommonCrawl, and certificate-transparency logs. Endpoints that existed last year but aren't in current OpenAPI may still be live and forgotten. Classic recon trick; underused.
-Idea 17: Encoding-confusion runner. Systematic tester for percent-encoding, double-encoding, Unicode normalization (NFC/NFD/NFKC), Unicode case folding, IDN homoglyphs, HTML entity decoding. For every endpoint that accepts text, sweeps the encoding axis and reports differential behavior (server interprets %25%32%65 as .? you have a path-traversal sanitizer bypass).
-Idea 18: HTTP request smuggling deep oracle. CL.TE, TE.CL, CL.CL, h2c upgrade smuggling, HTTP/2 header injection. Hard to write safely; valuable to encode once. Returns "this proxy/backend combination is smuggleable, here's the exact poisoning request."
-Idea 19: JWT forensics + forge tool. Algorithm confusion (RS256→HS256 with public key as secret), kid SQL injection, jwk header injection, weak-secret cracking via hashcat wrapper, none algorithm acceptance, expired-token-accepted oracle. Single-purpose oracle the validator can call when JWT is involved.
-Idea 20: Magic-bytes polyglot generator. Produces files that parse as both X and Y. Inputs: target filter (PNG-only upload) + payload type (HTML/JS/PHP/SVG). Output: a valid PNG byte stream containing executable content the browser/server will also parse. Pairs with file-upload specialist.
-Idea 21: Cookie/session-parser confusion tool. Different web framework cookie parsers (Tornado, Flask, Express, Rails) handle quoted values, semicolons, equals-in-value, __Host- prefix, partitioned cookies differently. A probe that walks every known parser quirk and reports which apply.
-Idea 22: Web cache poisoning probe. Unkeyed header detection (Vary: gaps), cache-key normalization quirks, cache-deception via path confusion (/profile/foo.css), edge-side-include injection. Returns the smallest header set that produces a cached-attack response.
-Idea 23: GraphQL nested-query depth bomber + alias enumerator. Mythos-style "weird machine" tooling for GraphQL specifically: enumerates the maximum nest depth and alias count the server accepts, both as a DoS oracle and as an authz-bypass oracle (some apps only check authz at depth 1).
-Idea 24: Library-version → known-attack mapper. Extends the gadget catalog. Given (lang, library, version), returns the full historical attack record: known CVEs, known bypass patches, known exploit chains, and known partial-fixes (where the patch closed the original report but a variant still works). The "known partial-fixes" is the big one — Mythos-style finds are often variants of nominally-fixed bugs.
-Idea 25: Inductive variant-hunting skill. "When you find one bug, immediately look for siblings." If a hunter finds SQLi at /api/users via id param, the variant search is automatic: every other endpoint, every other param, same handler structure. Encodes the universal observation that bugs come in clusters because patterns come in clusters. Lowers bugs-per-cluster from 1 to N.
-Idea 26: Counterfactual reasoning skill. "For this NOT to be a bug, what would have to be true?" Forces the validator to articulate the precondition for safety, which is usually narrower than they assumed. If the answer is "the framework would need to escape < here," check whether the framework actually does, in this version, for this content-type, for this template engine.
-Idea 27: Cargo-cult detection skill. Two near-identical code blocks in different files probably came from the same copy-paste. If one was fixed and the other wasn't, that's a finding. If the original (e.g. StackOverflow answer) was insecure, both are insecure. Pattern-match on near-duplicate code blocks across the repo.
-Idea 28: Surprise-as-evidence skill. When a hunter is surprised by behavior — code does something unexpected, a test fails for a wrong reason, a sanitizer is named differently than its function — that surprise is signal. Encode the discipline of stopping at every "huh, that's weird" moment and investigating. Most deep bugs live in the "huh" gap between mental model and reality.
-Idea 29: "Read the fix" skill. When git_history shows a security-relevant commit, the validator reads the diff with one specific question: "What was the bug class, and is this fix exhaustive?" Most "fix" commits address ONE manifestation; siblings often survive. Cheap but high-yield.
-Idea 30: Threat-model-from-architecture skill. Before hunting starts, generate a threat model from the manifest + service map: who are the actors, what are the assets, what are the trust boundaries, what are the in-scope attack vectors. The hunters then bias toward boundary-crossings.
-Orchestration modes
-Idea 31: Multi-model orchestration tier. Skeptic uses Haiku (already), recon uses Sonnet, hunters use Sonnet, validator uses Sonnet → Opus only on round 3+, chain-builder uses Opus, trust-shadow uses Opus. Currently most things run Opus. Mixed tier cuts cost ~3-4× with no quality loss for the agents that don't need reasoning depth.
-Idea 32: Diff-aware PR mode. LACUNA_MODE=diff — only scan files changed in the PR + their transitive imports + endpoints they touch. Cuts wall-clock from 4h to ~15min, suitable for blocking CI checks. Reuses incremental-chain-builder.
-Idea 33: Authenticated-as-different-users matrix mode. The DAST runs every probe as anonymous, as user, as admin, and reports cells where the responses are unexpectedly similar (anon should be 401, user should be 200, admin should be 200 — anon-200 is a finding).
-Idea 34: Tool-call result caching layer. semgrep_pattern, dependency_vulns, framework_detect, the call-graph build itself — cache by (repo, git_sha, args_hash). On re-scan of the same commit, these are free. Big wins for diff mode + interactive triage.
-Idea 35: Patch suggestion mode. For each finding, the validator emits a minimal proposed diff. Not "use parameterized queries" — the literal three-line PR. Saves remediation engineers 80% of the work, and often catches "the fix you propose doesn't actually close the underlying issue" cases.
-Idea 36: Failing-test-case generation. For every confirmed finding, generate a failing test in the project's test framework that asserts the secure behavior. Engineering can merge the test, write a fix, watch the test pass. Closes the loop from finding to merged code.
-Idea 37: Risk timeline + delta mode. Track findings across scans by stable IDs (location + shape + handler hash). The report shows "introduced in commit X, still open" / "previously found, now fixed (verified by re-scan)" / "new this scan." Closes-the-loop signal for security teams.
+# Ideas
+
+Not on the 3.0.0 roadmap — captured here so they aren't forgotten. Each
+idea is sized for "one well-scoped PR" rather than "another project."
+
+## Specialist agents
+
+* **Bitbucket MCP integration.** Let the orchestrator read PR diffs and
+  past Bitbucket comments via the official MCP server so historical
+  review context becomes evidence.
+* **OAuth / OIDC specialist.** Mix-up attacks, `redirect_uri`
+  smuggling, PKCE downgrade, ID-token confusion, JWKS cache poisoning.
+  Composes naturally with `trust-shadow-analyzer`.
+* **SAML specialist.** XML signature wrapping (XSW1–7), IdP/SP
+  confusion, signature exclusion, comment injection on assertions,
+  `RelayState` manipulation.
+* **SSRF deep specialist.** What to *do* with a confirmed SSRF: DNS
+  rebinding, parser-discrepancy SSRF, redirect-chain bypass, protocol
+  smuggling, blind-SSRF timing oracles, IPv6 confusion, IDN
+  homoglyphs. Pairs with the existing `gopherus` oracle.
+* **Race-condition specialist.** Single-packet attack (TCP last-byte
+  sync), session-state TOCTOU, row-locking gaps, distributed-lock
+  failures, cache-stampede windows — confirmed via concurrent-request
+  bursts through the DAST harness.
+* **Mass-assignment specialist.** Rails `strong_params`, Django
+  `ModelForm`, Pydantic `model_config`, Hibernate setters. Diff
+  client-facing DTOs against ORM models and flag every drift.
+* **IDOR matrix specialist.** Crawl every authenticated endpoint as
+  user A then re-issue as user B; flag rows where user B sees
+  non-404/non-403 responses.
+* **XXE / XML specialist.** Entity expansion, parameter entities,
+  billion-laughs, OOB XXE via DTD, XPath injection, schema-validation
+  bypass.
+* **File-upload polyglot specialist.** PHP-in-GIF, SVG-with-JS, ZIP
+  slip, polyglot PDFs, content-type sniff confusion. Pairs with a
+  magic-bytes polyglot generator (below).
+* **NoSQL injection specialist.** MongoDB operator injection, Redis
+  `CONFIG`/`EVAL`, Elasticsearch query DSL injection, CouchDB function
+  injection.
+* **GraphQL specialist.** Introspection enumeration (even when
+  "disabled"), nested-query DoS, batch-query rate-limit bypass,
+  mutation-vs-query authz drift, persisted-query injection.
+* **WebSocket / SSE specialist.** Cross-site WebSocket hijacking,
+  auth-on-connect-only handlers, out-of-order message bypass,
+  ping-pong abuse for connection persistence past token expiry.
+* **Build-system / CI specialist.** `pull_request_target` misuse,
+  third-party actions pinned by tag-not-SHA, secret-in-logs from
+  `set-output`, cache poisoning, dependency confusion, Dockerfile
+  `ADD` from remote URL.
+* **PII data-flow specialist.** Not strictly a security agent — a
+  data-flow agent that emits a PII map (which endpoints, logs, and
+  outbound calls touch which sensitive fields).
+
+## Tools and oracles
+
+* **JS bundle / sourcemap analyzer.** Extract API endpoints, secrets,
+  feature flags, internal route tables, and admin-only views from
+  production bundles and accidentally-shipped sourcemaps.
+* **Wayback / archive shadow-surface miner.** Historical URL lists
+  from the Wayback Machine, CommonCrawl, and CT logs to find forgotten
+  but still-live endpoints.
+* **Encoding-confusion runner.** Systematic percent / double / Unicode
+  normalization / IDN homoglyph testing for every text-accepting
+  endpoint.
+* **HTTP request smuggling deep oracle.** CL.TE, TE.CL, CL.CL,
+  `h2c` upgrade smuggling, HTTP/2 header injection. The current
+  `_t_smuggling_probe` is a start; an oracle that returns the exact
+  poisoning request would be next.
+* **JWT forensics + forge tool.** Algorithm confusion, `kid` SQL
+  injection, `jwk` header injection, weak-secret cracking, `none`
+  acceptance, expired-token acceptance.
+* **Magic-bytes polyglot generator.** Files that parse as both X and
+  Y, given a target filter + payload type. Pairs with the file-upload
+  specialist.
+* **Cookie / session-parser confusion tool.** Probe every known
+  framework parser quirk (Tornado, Flask, Express, Rails) and report
+  which apply to the target.
+* **Web cache poisoning probe.** Unkeyed header detection (`Vary`
+  gaps), cache-key normalization quirks, cache deception via path
+  confusion, ESI injection.
+* **GraphQL nested-query bomber + alias enumerator.** Per-server max
+  nest depth + alias count as a DoS and authz-bypass oracle.
+* **Library-version → known-attack mapper.** Extends the gadget
+  catalog with full historical attack records: CVEs, bypass patches,
+  known partial-fixes. The "partial-fixes" axis is the high-value one.
+
+## Skills
+
+* **Inductive variant-hunting skill.** When you find one bug, look for
+  siblings immediately. Lowers bugs-per-cluster from 1 to N.
+* **Counterfactual reasoning skill.** "For this *not* to be a bug,
+  what would have to be true?" Forces the validator to articulate the
+  precondition for safety.
+* **Cargo-cult detection skill.** Near-identical code blocks across
+  files probably share a copy-paste origin; if one was fixed, check
+  the other.
+* **Surprise-as-evidence skill.** Encode the discipline of stopping
+  at every "huh, that's weird" moment and investigating.
+* **"Read the fix" skill.** *(Already shipped — see
+  `.claude/skills/read-the-fix/SKILL.md`.)* Mentioned here for
+  completeness.
+* **Threat-model-from-architecture skill.** Generate a per-scan
+  threat model from the manifest + service map before hunting starts.
+
+## Orchestration modes
+
+* **Multi-model tiering.** Skeptic on Haiku (already), recon and
+  hunters on Sonnet, validator escalates to Opus only on round 3+.
+  Mixed tier cuts cost ~3–4× with negligible quality loss.
+* **`LACUNA_MODE=diff`** — only scan files changed in the PR + their
+  transitive imports + the endpoints they touch. Wall-clock drops
+  from hours to ~15 min.
+* **Authenticated-as-different-users matrix mode.** DAST runs every
+  probe as anonymous, user, and admin; flag cells where responses are
+  unexpectedly similar.
+* **Tool-call result caching layer.** Cache `semgrep_pattern`,
+  `dependency_vulns`, `framework_detect`, and the call-graph build by
+  `(repo, git_sha, args_hash)`. Pairs well with diff mode.
+* **Patch suggestion mode.** For each finding, emit a minimal proposed
+  diff — the literal 3-line PR, not "use parameterized queries."
+* **Failing-test-case generation.** Emit a failing test in the
+  project's test framework asserting the secure behavior.
+* **Risk-timeline + delta mode.** Track findings across scans by
+  stable ID (location + shape + handler hash); report introduced,
+  still-open, fixed, and new findings.

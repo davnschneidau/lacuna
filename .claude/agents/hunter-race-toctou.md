@@ -2,7 +2,7 @@
 name: hunter-race-toctou
 description: |
   Form hypotheses where the *same* state is read, checked, then mutated without atomicity. Particular focus on financial flows, redemption codes, and resource grants.
-model: ${LACUNA_MODEL_OPUS}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

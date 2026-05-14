@@ -20,7 +20,7 @@ Implementation notes:
 """
 from __future__ import annotations
 
-import base64
+import contextlib
 import json
 import os
 import subprocess
@@ -48,68 +48,93 @@ class SymexResult:
 # so we get hard timeout enforcement, and angr's verbose logging doesn't
 # pollute our process.
 ANGR_DRIVER = r'''
-import sys, json, base64
+import sys, json, base64, logging, os, signal
 
 binary_path  = sys.argv[1]
 source_name  = sys.argv[2]
 target_name  = sys.argv[3]
 timeout_s    = int(sys.argv[4])
 
+# Route angr's chatty logging to stderr (and silence the warning floor) so
+# our single JSON line on stdout is unambiguous.
+logging.basicConfig(stream=sys.stderr, level=logging.ERROR)
+for noisy in ("angr", "cle", "claripy", "pyvex"):
+    logging.getLogger(noisy).setLevel(logging.ERROR)
+
+def _emit(payload):
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
 try:
     import angr
     import angr.exploration_techniques as tech
 except ImportError:
-    print(json.dumps({"error": "angr not installed"}))
+    _emit({"error": "angr not installed"})
     sys.exit(2)
+
+# Hard SIGALRM cap. ``threading.Event.wait`` (the old approach) doesn't
+# actually interrupt simgr.step() — it only flips a flag the loop will
+# observe in between symbolic instructions, which can take many seconds
+# each. SIGALRM raises mid-step.
+class SymExTimeout(Exception):
+    pass
+
+def _alarm_handler(signum, frame):
+    raise SymExTimeout("symex exceeded budget")
+
+if hasattr(signal, "SIGALRM"):
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(timeout_s)
 
 try:
     proj = angr.Project(binary_path, auto_load_libs=False)
     src_sym = proj.loader.find_symbol(source_name)
     tgt_sym = proj.loader.find_symbol(target_name)
     if not src_sym:
-        print(json.dumps({"error": f"source symbol not found: {source_name}"}))
+        _emit({"error": "source symbol not found: " + source_name})
         sys.exit(0)
     if not tgt_sym:
-        print(json.dumps({"error": f"target symbol not found: {target_name}"}))
+        _emit({"error": "target symbol not found: " + target_name})
         sys.exit(0)
 
     state = proj.factory.call_state(src_sym.rebased_addr)
     simgr = proj.factory.simulation_manager(state)
     simgr.use_technique(tech.Explorer(find=tgt_sym.rebased_addr))
 
-    import threading
-    done = threading.Event()
-    def stop_after():
-        done.wait(timeout_s)
-    t = threading.Thread(target=stop_after, daemon=True); t.start()
-
-    while simgr.active and not done.is_set():
+    while simgr.active:
         simgr.step()
         if simgr.found:
             break
 
     if simgr.found:
         s = simgr.found[0]
-        # Try to extract stdin or initial argv as the concrete input
         stdin_bytes = b""
         try:
             stdin_bytes = s.posix.dumps(0)
         except Exception:
             pass
-        print(json.dumps({
+        _emit({
             "reachable": True,
             "concrete_input_b64": base64.b64encode(stdin_bytes).decode(),
-            "path_summary": f"explored {len(simgr.deadended) + len(simgr.found)} states",
+            "path_summary": "explored " + str(len(simgr.deadended) + len(simgr.found)) + " states",
             "explored_states": len(simgr.deadended) + len(simgr.found),
-        }))
+        })
     else:
-        print(json.dumps({
+        _emit({
             "reachable": False,
             "path_summary": "target not reached in budget",
             "explored_states": len(simgr.deadended),
-        }))
+        })
+except SymExTimeout:
+    _emit({
+        "reachable": False,
+        "path_summary": "symex timed out after " + str(timeout_s) + "s",
+        "explored_states": 0,
+        "error": "timeout",
+    })
 except Exception as e:
-    print(json.dumps({"error": f"angr exception: {e}"}))
+    _emit({"error": "angr exception: " + repr(e)})
 '''
 
 
@@ -146,19 +171,35 @@ def symex_reach(
             error_message="symex driver process timed out",
         )
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(driver)
-        except OSError:
-            pass
 
-    try:
-        data = json.loads(proc.stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
+    data: dict | None = None
+    parse_error: str | None = None
+    for line in reversed(proc.stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError as exc:
+            parse_error = str(exc)
+            continue
+        if isinstance(candidate, dict):
+            data = candidate
+            break
+    if data is None:
+        tail_err = (proc.stderr or "")[-300:]
+        tail_out = (proc.stdout or "")[-300:]
         return SymexResult(
             binary_path=binary_path, source=source, target=target,
             timeout_s=timeout_seconds, reachable=False,
             duration_s=int(time.time() - start),
-            error_message=f"could not parse angr output: {proc.stderr[:300]}",
+            error_message=(
+                "could not parse angr output: "
+                f"{parse_error or 'no JSON object on stdout'}; "
+                f"stderr_tail={tail_err!r}; stdout_tail={tail_out!r}"
+            ),
         )
 
     if "error" in data:

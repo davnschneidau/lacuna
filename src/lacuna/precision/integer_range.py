@@ -47,11 +47,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from lacuna.flow.ast_parse import (
-    Node, parse_python_file, parse_with_tree_sitter,
+    Node,
+    parse_python_file,
+    parse_with_tree_sitter,
 )
+from lacuna.flow.taint import HANDLER_DECORATORS
 
 SKIP = re.compile(
     r"/(\.git|node_modules|\.venv|venv|__pycache__|dist|build|target|"
@@ -73,20 +75,24 @@ ATTACKER_SOURCE_RE = re.compile(
 
 # Allocation-site patterns. Matched against Call.name (which is qualified
 # enough — e.g. "subprocess.run" — for our purposes).
+#
+# The tree-sitter adapter renders ``new T(...)`` and ``new T[n]`` as Call
+# nodes with names ``new T`` / ``new T[]``, so the regexes below match on
+# those forms.
 ALLOC_PATTERNS = {
     "malloc":   re.compile(r"\bmalloc\b"),
     "calloc":   re.compile(r"\bcalloc\b"),
     "realloc":  re.compile(r"\brealloc\b"),
     "kmalloc":  re.compile(r"\b(k(?:m|z)alloc|vmalloc|kcalloc)\b"),
     "alloca":   re.compile(r"\balloca\b"),
-    "new[]":    re.compile(r"new\s+\w+"),
+    "new[]":    re.compile(r"^new\s+\w+(\[\])?$"),
     "go_make":  re.compile(r"^make$|\bmake$"),
-    "java_arr": re.compile(r"new\s+(byte|int|long|char|short)\["),
+    "java_arr": re.compile(r"^new\s+(byte|int|long|char|short|float|double|"
+                            r"Object|String|\w+)\[\]"),
     "bytebuf":  re.compile(r"\bByteBuffer\.(allocate|allocateDirect)\b|"
                             r"ByteBuffer\.allocate"),
     "py_bytes": re.compile(r"^(bytearray|bytes)$|"
                             r"\.(bytearray|bytes)$"),
-    "py_list_mul": re.compile(r"<list_mul>"),  # special tag set by AST walker
 }
 
 INDEX_GUARD_RE = re.compile(
@@ -153,10 +159,7 @@ def analyze(repo_root: Path, repo_name: str | None = None,
         if not lang:
             continue
         try:
-            if lang == "python":
-                root = parse_python_file(p)
-            else:
-                root = parse_with_tree_sitter(p, lang)
+            root = parse_python_file(p) if lang == "python" else parse_with_tree_sitter(p, lang)
         except Exception:
             continue
         if root is None:
@@ -189,6 +192,18 @@ def _analyze_module(
     _analyze_function(root, rel, repo_name, lang, out, top_level=True)
 
 
+def _is_handler_function(fn: Node) -> bool:
+    """A function is a handler when any of its decorators matches the v2
+    flow engine's handler pattern (Flask/FastAPI/Spring/Express/...).
+
+    We previously auto-tainted *every* function parameter as attacker. That
+    produced one alloc-finding per malloc in every helper function — drowning
+    the validator. Now we taint parameters only when there's reason to
+    believe an attacker actually controls them.
+    """
+    return any(HANDLER_DECORATORS.search(str(d)) for d in fn.attrs.get("decorators", []) or [])
+
+
 def _analyze_function(
     fn: Node, file: str, repo: str, lang: str,
     out: list[Finding], top_level: bool = False,
@@ -196,15 +211,16 @@ def _analyze_function(
     state: dict[str, VarShape] = {}
     fn_name = fn.name or "<module>"
 
-    # Pre-mark function parameters as attacker-controlled if the function
-    # is a handler (heuristic — refined by data-flow analysis later).
-    for p in fn.attrs.get("params", []) or []:
-        if p not in ("self", "cls", "this"):
+    # Only tag parameters as attacker-controlled on handler-shaped functions.
+    if _is_handler_function(fn):
+        for p in fn.attrs.get("params", []) or []:
+            if p in ("self", "cls", "this"):
+                continue
             state[p] = VarShape(
                 name=p, kind="attacker",
-                sources=["function_param"],
+                sources=["handler_param"],
                 defined_at_line=fn.line,
-                defined_in_expr=f"<parameter {p}>",
+                defined_in_expr=f"<handler parameter {p}>",
             )
 
     for stmt in _flatten_stmts(fn):
@@ -236,6 +252,9 @@ def _step(
         for ch in node.children:
             if ch.kind == "Call":
                 _check_allocation(ch, state, lang, file, repo, fn_name, out)
+            if ch.kind == "BinOp":
+                _check_list_replicate(ch, node, state, lang, file, repo,
+                                       fn_name, out)
     elif node.kind == "Call":
         _check_allocation(node, state, lang, file, repo, fn_name, out)
         # Recurse into args
@@ -248,8 +267,58 @@ def _step(
             _step(ch, state, lang, file, repo, fn_name, out)
     else:
         for ch in node.children:
-            if ch.kind in {"Assign", "Call", "If", "For", "While", "Try"}:
+            if ch.kind in {"Assign", "Call", "If", "For", "While", "Try",
+                            "BinOp"}:
                 _step(ch, state, lang, file, repo, fn_name, out)
+
+
+def _check_list_replicate(
+    binop: Node, assign: Node, state: dict[str, VarShape],
+    lang: str, file: str, repo: str, fn_name: str, out: list[Finding],
+) -> None:
+    """Detect Python ``[0] * n`` (and similar) where ``n`` is attacker-
+    controlled. Replaces the ``py_list_mul`` dead-pattern regex with real
+    AST inspection.
+    """
+    if binop.attrs.get("op") != "*":
+        return
+    children = binop.children
+    if len(children) != 2:
+        return
+    list_child, num_child = None, None
+    for c in children:
+        if c.kind == "List" or c.kind.endswith("List") or c.kind == "list":
+            list_child = c
+        else:
+            num_child = c
+    if list_child is None or num_child is None:
+        return
+    expr = assign.attrs.get("rhs_repr", "") or ""
+    referenced = [
+        v for v in state
+        if re.search(rf"\b{re.escape(v)}\b", expr)
+        and state[v].kind in ("attacker", "derived")
+    ]
+    if not referenced:
+        return
+    out.append(Finding(
+        kind="oversized_alloc",
+        repo=repo, file=file, line=assign.line,
+        function_qual=fn_name,
+        cwe="CWE-789",
+        detail_md=(
+            f"`{expr}` at {file}:{assign.line} — Python list replication "
+            f"with attacker-controlled multiplier ({', '.join(referenced)}). "
+            "Large multipliers can exhaust memory."
+        ),
+        evidence={
+            "expression": expr,
+            "risky_vars": referenced,
+            "language": lang,
+            "allocator": "py_list_replicate",
+        },
+        confidence=0.55,
+    ))
 
 
 def _handle_assign(
@@ -302,30 +371,62 @@ def _handle_assign(
     # Otherwise: unknown shape — fall through (do nothing)
 
 
+_BOUND_CHECK_PATTERNS = (
+    # if (x < CONST)
+    re.compile(r"\bif\s*\(?\s*([A-Za-z_]\w*)\s*(?:<|<=)\s*([A-Za-z_0-9.]+)"),
+    # if (CONST > x)
+    re.compile(r"\bif\s*\(?\s*([A-Za-z_0-9.]+)\s*(?:>|>=)\s*([A-Za-z_]\w*)"),
+    # Python: ``if x < CONST:``
+    re.compile(r"\bif\s+([A-Za-z_]\w*)\s*(?:<|<=)\s*([A-Za-z_0-9.]+)\s*:"),
+    # Python: ``x = min(x, CONST)`` clamps x
+    re.compile(r"\b([A-Za-z_]\w*)\s*=\s*min\(\s*\1\s*,\s*([A-Za-z_0-9.]+)\)"),
+)
+
+
 def _propagate_bound_checks(
     branch_node: Node, state: dict[str, VarShape],
 ) -> None:
-    """Look for `if (x < CONST)` style bound checks inside the branch.
-    Mark variables as `checked` for the duration of the branch's body."""
-    # Heuristic: look at the branch's src snippet (where available)
+    """Look for ``if (x < CONST)`` style bound checks inside the branch.
+
+    Marks ``x`` as ``checked`` while the bounded branch is being walked.
+    Now works for Python too because the AST adapter attaches
+    ``src_snippet`` on If/For/While/Try nodes for every language.
+    """
     snippet = branch_node.attrs.get("src_snippet", "")
     if not snippet:
-        return
-    for m in re.finditer(
-        r"\bif\s*\(?\s*(\w+)\s*(?:<|<=)\s*(\w+)", snippet,
-    ):
-        var, bound = m.group(1), m.group(2)
-        if var in state and state[var].kind in ("attacker", "derived"):
-            # Is the bound a "max-ish" constant?
-            if any(h in bound.upper() for h in BOUND_CHECK_HINTS) \
-                    or bound.isdigit():
-                state[var] = VarShape(
-                    name=var, kind="checked",
-                    sources=state[var].sources,
-                    bound_hi=int(bound) if bound.isdigit() else None,
-                    defined_at_line=state[var].defined_at_line,
-                    defined_in_expr=state[var].defined_in_expr + f" [checked < {bound}]",
-                )
+        # Fall back to the If's recorded test expression.
+        test = branch_node.attrs.get("test_repr", "")
+        if not test:
+            return
+        snippet = f"if {test}:"
+
+    seen_vars: set[str] = set()
+    for pat in _BOUND_CHECK_PATTERNS:
+        for m in pat.finditer(snippet):
+            var, bound = m.group(1), m.group(2)
+            if var in seen_vars:
+                continue
+            if var not in state:
+                continue
+            if state[var].kind not in ("attacker", "derived"):
+                continue
+            bound_hi: int | None = None
+            if bound.isdigit():
+                bound_hi = int(bound)
+            elif any(h in bound.upper() for h in BOUND_CHECK_HINTS):
+                bound_hi = None
+            else:
+                continue
+            state[var] = VarShape(
+                name=var, kind="checked",
+                sources=state[var].sources,
+                bound_hi=bound_hi,
+                defined_at_line=state[var].defined_at_line,
+                defined_in_expr=(
+                    state[var].defined_in_expr + f" [checked < {bound}]"
+                ),
+            )
+            seen_vars.add(var)
 
 
 def _check_allocation(
@@ -352,12 +453,16 @@ def _check_allocation(
     size_args = args if matched_kind == "calloc" else [args[0]]
 
     for size_expr in size_args:
+        size_expr_str = str(size_expr)
         # Skip pure literals (e.g. malloc(1024))
-        if size_expr.isdigit() or size_expr.lstrip("-").isdigit():
+        if (
+            size_expr_str.isdigit()
+            or size_expr_str.lstrip("-").isdigit()
+        ):
             continue
         # Any referenced var that's attacker-controlled?
         referenced = [v for v in state
-                      if re.search(rf"\b{re.escape(v)}\b", str(size_expr))]
+                      if re.search(rf"\b{re.escape(v)}\b", size_expr_str)]
         risky_refs = [
             v for v in referenced
             if state[v].kind in ("attacker", "derived")
@@ -365,10 +470,11 @@ def _check_allocation(
         if not risky_refs:
             continue
 
-        # Check for multiplication in the expression — strong CWE-190 signal
-        is_multiplicative = bool(re.search(
-            r"\*|\bsizeof\b|\bmul_overflow\b", str(size_expr),
-        ))
+        # Multiplication detection. The new ast_parse preserves the actual
+        # operator in BinOp.attrs["op"] for both Python and tree-sitter, so
+        # this also fires on Python ``n * SOME_SIZE`` size expressions which
+        # previously silently failed.
+        is_multiplicative = _expr_is_multiplicative(size_expr_str, call)
         cwe = "CWE-190" if is_multiplicative else "CWE-789"
         kind_label = "int_overflow" if is_multiplicative else "oversized_alloc"
 
@@ -400,6 +506,27 @@ def _check_allocation(
             },
             confidence=0.7 if is_multiplicative else 0.55,
         ))
+
+
+def _expr_is_multiplicative(size_expr: str, call: Node) -> bool:
+    """Return True if the allocation's size expression is the product of two
+    sub-expressions (a CWE-190 hallmark).
+
+    We check both the raw text (catches C/C++/Java/Go where the snippet
+    literally contains ``*``) and the BinOp children of the call (catches
+    Python where ``ast.BinOp(op=Mult())`` is preserved by the adapter).
+    """
+    if re.search(r"\*|\bsizeof\b|\bmul_overflow\b", size_expr):
+        return True
+    for child in call.children:
+        if child.kind == "BinOp" and child.attrs.get("op") == "*":
+            return True
+        # Recurse one level: tree-sitter may wrap the BinOp in an extra
+        # node (e.g. argument_list).
+        for grand in child.children:
+            if grand.kind == "BinOp" and grand.attrs.get("op") == "*":
+                return True
+    return False
 
 
 def _try_constant(expr: str) -> int | None:

@@ -5,7 +5,7 @@ description: |
   requests when DAST is enabled, and either promotes hypotheses to findings
   (with evidence and primitives) or refutes them (with reasoning). Up to 4
   rounds per hypothesis. Marks hypotheses needs_human when truly ambiguous.
-model: ${LACUNA_MODEL_OPUS}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.hypotheses
@@ -18,6 +18,7 @@ tools:
   - mcp__lacuna-kg__kg.write.finding
   - mcp__lacuna-kg__kg.write.primitive
   - mcp__lacuna-kg__kg.write.attach_evidence
+  - mcp__lacuna-kg__kg.write.minimal_repro
   - mcp__lacuna-kg__kg.write.event
   - mcp__lacuna-recon__code_excerpt
   - mcp__lacuna-recon__ast_query
@@ -39,6 +40,7 @@ skills:
   - red-blue-dialectic
   - primitive-extraction
   - poc-drafting
+  - minimal-repro
   - vulnerability-researcher
   - trust-the-fuzzer
   - interesting-input

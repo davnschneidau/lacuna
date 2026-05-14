@@ -1,8 +1,12 @@
 name: Lacuna Security Scanner
-image: lacuna:1.0.0
+# Bump this tag in lock-step with src/lacuna/__init__.py. CI verifies the two
+# are identical.
+image: lacuna:3.0.0
 description: Agentic, application-level security scanner. SAST and DAST for multi-repo applications, powered by Claude Code through Azure Foundry.
-repository: https://your-bitbucket-workspace/lacuna
-maintainer: security@your-org.example
+# Replace <your-workspace> with the Bitbucket workspace slug that hosts your
+# fork of the pipe before publishing.
+repository: https://bitbucket.org/<your-workspace>/lacuna
+maintainer: security@example.com
 tags:
   - security
   - sast

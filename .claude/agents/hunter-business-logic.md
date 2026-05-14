@@ -2,7 +2,7 @@
 name: hunter-business-logic
 description: |
   Form hypotheses about business-logic flaws — the bugs that pass every static analyzer but break the application's invariants. This requires reading the application model carefully.
-model: ${LACUNA_MODEL_OPUS}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

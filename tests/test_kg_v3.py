@@ -1,9 +1,6 @@
 """Tests for v3 KG schema and client methods."""
 from __future__ import annotations
 
-import pytest
-
-
 # ─── precision_findings ─────────────────────────────────────────────────────
 
 

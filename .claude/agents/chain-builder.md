@@ -5,7 +5,7 @@ description: |
   ledger — no code, no findings prose, no transcripts. Matches effects to
   prerequisites until no new chains emerge. Marks all primitives chain_explored
   and sets chain_search_exhausted.
-model: ${LACUNA_MODEL_OPUS}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.primitives
   - mcp__lacuna-kg__kg.read.application_model

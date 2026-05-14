@@ -35,10 +35,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from lacuna.flow.ast_parse import (
-    Node, parse_python_file, parse_with_tree_sitter,
-)
-
 SKIP = re.compile(
     r"/(\.git|node_modules|\.venv|venv|__pycache__|dist|build|target|"
     r"vendor)/"
@@ -191,50 +187,66 @@ def _analyze_python(text: str, file: str, repo: str,
 
 def _analyze_java(text: str, file: str, repo: str,
                   out: list[Finding]) -> None:
-    """Java: explicit cast following a deserialization."""
-    # Find readObject / readValue / etc. then look for an unsafe cast nearby
+    """Java: explicit casts following a deserialization.
+
+    Finds *every* cast in the window after a deserialize call, not just
+    the first. A single ``readObject`` is often immediately followed by
+    multiple casts (one per field accessed); each is independently a
+    CWE-843 hazard if not guarded.
+    """
     for m in DESERIAL_SOURCES.finditer(text):
-        line_no = text[:m.start()].count("\n") + 1
+        deserial_line_no = text[:m.start()].count("\n") + 1
         window = text[m.start():m.start() + 600]
-        cast_match = JAVA_CAST_RE.search(window)
-        if not cast_match:
-            continue
-        # If the cast is wrapped in instanceof, skip
-        if re.search(rf"\binstanceof\s+{re.escape(cast_match.group(1))}",
-                     window):
-            continue
-        cast_line = line_no + window[:cast_match.start()].count("\n")
-        out.append(Finding(
-            kind="type_confusion",
-            repo=repo, file=file, line=cast_line,
-            function_qual=None,
-            cwe="CWE-843",
-            detail_md=(
-                f"Cast to `{cast_match.group(1)}` follows a deserialize "
-                f"operation at line {line_no} without an `instanceof` "
-                f"guard. If the deserialized stream is attacker-controlled, "
-                f"the cast may produce a `ClassCastException` at best, "
-                f"and a confused-type read/write at worst."
-            ),
-            evidence={
-                "cast_target": cast_match.group(1),
-                "source_line": line_no, "cast_line": cast_line,
-            },
-            confidence=0.6,
-        ))
+        for cast_match in JAVA_CAST_RE.finditer(window):
+            target_type = cast_match.group(1)
+            # If the cast is wrapped in an ``instanceof`` guard for the
+            # same target type anywhere in the window, treat it as safe.
+            if re.search(
+                rf"\binstanceof\s+{re.escape(target_type)}\b", window,
+            ):
+                continue
+            cast_line = (
+                deserial_line_no + window[:cast_match.start()].count("\n")
+            )
+            out.append(Finding(
+                kind="type_confusion",
+                repo=repo, file=file, line=cast_line,
+                function_qual=None,
+                cwe="CWE-843",
+                detail_md=(
+                    f"Cast to `{target_type}` follows a deserialize "
+                    f"operation at line {deserial_line_no} without an "
+                    f"`instanceof` guard. If the deserialized stream is "
+                    f"attacker-controlled, the cast may produce a "
+                    f"`ClassCastException` at best, and a confused-type "
+                    f"read/write at worst."
+                ),
+                evidence={
+                    "cast_target": target_type,
+                    "source_line": deserial_line_no,
+                    "cast_line": cast_line,
+                },
+                confidence=0.6,
+            ))
+
+
+_CPP_BUFFER_NAMES = (
+    "buf", "buffer", "data", "msg", "message", "pkt", "pkt_buf", "packet",
+    "payload", "body", "input", "raw", "bytes", "chunk", "frame", "rx",
+    "tx", "stream", "header", "hdr",
+)
+_CPP_BUFFER_PAT = re.compile(
+    r">\s*\(\s*(" + "|".join(_CPP_BUFFER_NAMES) + r")\b",
+)
 
 
 def _analyze_cpp(text: str, file: str, repo: str, lang: str,
                  out: list[Finding]) -> None:
-    """C/C++: reinterpret_cast and C-style casts on buffer-derived pointers."""
+    """C/C++: reinterpret_cast and static_cast on buffer-derived pointers."""
     for m in CPP_CAST_RE.finditer(text):
         line_no = text[:m.start()].count("\n") + 1
-        # Look at the next 200 chars for what's being cast
         tail = text[m.start():m.start() + 300]
-        # Heuristic: is the casted expression a buffer pointer? (e.g.
-        # reinterpret_cast<struct X*>(buf))
-        if re.search(r">\s*\(\s*(buf|data|msg|pkt|packet|payload|body|input)\b",
-                     tail):
+        if _CPP_BUFFER_PAT.search(tail):
             cast_kind = m.group(1)
             out.append(Finding(
                 kind="type_confusion",
@@ -289,30 +301,54 @@ def _analyze_go(text: str, file: str, repo: str,
             ))
 
 
+_TS_AS_PATTERNS = (
+    # JSON.parse(...) as T
+    re.compile(r"JSON\.parse\s*\([^)]*\)\s*as\s+([A-Z]\w+)"),
+    # fetch(...).then(r => r.json()) as T
+    re.compile(
+        r"\.then\s*\(\s*\w+\s*=>\s*\w+\.json\s*\(\s*\)\s*\)\s*as\s+([A-Z]\w+)"
+    ),
+    # await req.json() as T  /  await response.json() as T
+    re.compile(r"await\s+[\w.]*?\.json\s*\(\s*\)\s*as\s+([A-Z]\w+)"),
+    # await fetch(...).then(...) as T
+    re.compile(
+        r"await\s+fetch\s*\([^)]*\)\.\w+\([^)]*\)\s*as\s+([A-Z]\w+)"
+    ),
+)
+
+
 def _analyze_ts(text: str, file: str, repo: str,
                 out: list[Finding]) -> None:
-    """TypeScript: `as T` without a corresponding type guard."""
-    # Find `JSON.parse(...) as SomeType` patterns
-    for m in re.finditer(
-        r"JSON\.parse\s*\([^)]*\)\s*as\s+([A-Z]\w+)",
-        text,
-    ):
-        line_no = text[:m.start()].count("\n") + 1
-        out.append(Finding(
-            kind="type_confusion",
-            repo=repo, file=file, line=line_no,
-            function_qual=None,
-            cwe="CWE-843",
-            detail_md=(
-                f"`JSON.parse(...) as {m.group(1)}` at {file}:{line_no}. "
-                f"TypeScript's `as` is unchecked at runtime. If the input "
-                f"is attacker-controlled, downstream code may dereference "
-                f"undefined fields or behave unexpectedly. Prefer a Zod/"
-                f"Yup/io-ts schema validation."
-            ),
-            evidence={"cast_target": m.group(1)},
-            confidence=0.55,
-        ))
+    """TypeScript: ``as T`` without a corresponding type guard.
+
+    Covers the three common shapes for runtime-unchecked casts:
+      * ``JSON.parse(x) as T``
+      * ``fetch(...).then(r => r.json()) as T``
+      * ``await req.json() as T``
+    """
+    seen: set[int] = set()
+    for pat in _TS_AS_PATTERNS:
+        for m in pat.finditer(text):
+            if m.start() in seen:
+                continue
+            seen.add(m.start())
+            line_no = text[:m.start()].count("\n") + 1
+            out.append(Finding(
+                kind="type_confusion",
+                repo=repo, file=file, line=line_no,
+                function_qual=None,
+                cwe="CWE-843",
+                detail_md=(
+                    f"`{m.group(0)}` at {file}:{line_no}. TypeScript's "
+                    f"`as` is unchecked at runtime. If the input is "
+                    f"attacker-controlled, downstream code may "
+                    f"dereference undefined fields or behave "
+                    f"unexpectedly. Prefer a Zod/Yup/io-ts schema "
+                    f"validation."
+                ),
+                evidence={"cast_target": m.group(1)},
+                confidence=0.55,
+            ))
 
 
 def _to_dict(f: Finding) -> dict:

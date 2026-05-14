@@ -2,23 +2,20 @@
 
 > Agentic, multi-repo, application-level security scanner. Mythos-style behavior on top of Claude Code. SAST and DAST in one box. Runs as a Docker container — Bitbucket Cloud pipe or ad-hoc.
 
-**v3.0.0** — CVE-grade vulnerability discovery. v3 adds precision static
-analysis (integer overflow / use-after-free / format string / type
-confusion), dynamic confirmation oracles (sanitizer builds, libFuzzer,
-angr symex, parser-differential testing), patch-diff infrastructure
-(variant search from your own git history), and the researcher-mindset
-skills (`vulnerability-researcher`, `interesting-input`, `trust-the-fuzzer`,
-`read-the-fix`, `adversary-pricing`) plus three new agents
-(`patch-archaeologist`, `variant-hunter`, `fuzzing-coordinator`). See
-`CHANGELOG.md` for the full v3 entry.
+**3.0.0** — initial public release. Bundles:
 
-**v2.0.0** — added the from-scratch inter-procedural taint engine
-(CodeQL-equivalent), git-history-as-evidence, known-gadget catalog,
-deep oracles (sqlmap/ysoserial/gopherus), headless Playwright DAST,
-state-machine extraction, custom semgrep per scan, test-coverage-as-oracle,
-parallel hunters/validators, speculative re-open, adversarial skeptic
-pass, trust-shadow capability mapping, minimal-repro enforcement, and
-coverage-aware reporting.
+* the inter-procedural taint / data-flow engine,
+* precision static analysis (integer overflow, use-after-free, format
+  strings, type confusion),
+* dynamic confirmation oracles (sanitizer builds, libFuzzer, angr
+  symex, parser-differential testing),
+* patch-essence extraction and variant propagation,
+* deep oracles (sqlmap / ysoserial / gopherus),
+* a headless Playwright DAST runner,
+* the skeptic + trust-shadow + patch-archaeologist + variant-hunter +
+  fuzzing-coordinator agents.
+
+See `CHANGELOG.md` for the full release notes.
 
 Lacuna scans **applications**, not repositories. You give it a manifest declaring the 1..N repos that compose your application and the trust boundaries between them, and it returns two reports: an executive narrative of risk and a technical catalog of findings, exploit primitives, and composed attack chains.
 
@@ -34,24 +31,26 @@ It is built around four ideas, in order of importance:
 ```
 lacuna/
 ├── Dockerfile                # Container image, multi-stage
-├── pyproject.toml            # Python package (v2.0.0)
+├── pyproject.toml            # Python package (3.0.0)
 ├── CHANGELOG.md              # Version history
 ├── bitbucket-pipe/           # Bitbucket Pipe definition + entrypoint
 ├── src/lacuna/               # Python: KG, flow engine, MCP servers, oracles, hooks, harness, reports
-│   ├── flow/                 # NEW v2: inter-procedural taint engine (CodeQL-equivalent)
-│   ├── oracles/              # NEW v2: sqlmap / ysoserial / gopherus wrappers
+│   ├── flow/                 # Inter-procedural taint engine
+│   ├── precision/            # Precision static analysis: integer range, lifetime, format-string, type-confusion
+│   ├── dynamic/              # Sanitizer builds, libFuzzer wrapper, angr symex, differential parsers
+│   ├── patches/              # Patch-essence extraction + variant propagation
+│   ├── oracles/              # sqlmap / ysoserial / gopherus wrappers
 │   ├── tools/                # MCP recon/kg/dast servers + git_history, custom_semgrep, test_coverage, state_machine, gadget_catalog, trust_shadow
 │   ├── dast/                 # Includes Playwright runner for DOM-XSS / postMessage / DOM clobbering
 │   └── ...
 ├── .claude/                  # Claude Code config: CLAUDE.md, agents, skills, hooks, settings
-│   ├── agents/               # 8 hunters + recon + validator + chain-builder + skeptic + trust-shadow-analyzer
-│   └── skills/               # 13 skills incl. weird-machine, trust-shadow-mapping, minimal-repro, cross-hunter-observations
+│   ├── agents/               # Hunters + recon + validator + chain-builder + skeptic + trust-shadow-analyzer + patch-archaeologist + variant-hunter + fuzzing-coordinator
+│   └── skills/               # Skills incl. weird-machine, trust-shadow-mapping, minimal-repro, cross-hunter-observations, vulnerability-researcher, trust-the-fuzzer
 ├── examples/                 # Sample manifest + bitbucket-pipelines.yml
 ├── tests/                    # Unit tests for KG, hooks, MCP servers, flow engine
-├── docs/
-│   ├── ARCHITECTURE.md       # System design
-│   └── CONTEXT_STRATEGY.md   # Mythos-style context management deep-dive
-└── scripts/                  # Dev helpers
+└── docs/
+    ├── ARCHITECTURE.md       # System design
+    └── CONTEXT_STRATEGY.md   # Mythos-style context management deep-dive
 ```
 
 ## Quick start (ad-hoc)
@@ -87,7 +86,7 @@ pipelines:
           name: Lacuna application scan
           services: [docker]
           script:
-            - pipe: docker://your-registry/lacuna:1.0.0
+            - pipe: docker://your-registry/lacuna:3.0.0
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'
@@ -151,8 +150,25 @@ v3 organizes its new capabilities into five layered modules:
 
 ## Status
 
-Initial release. Production-shaped but expect rough edges. Issues, contributions, and adversarial test cases welcome.
+Initial release (3.0.0). Production-shaped but expect rough edges. Some
+oracles (libFuzzer, angr symex, ysoserial, sqlmap, gopherus, Playwright)
+are best-effort wrappers around external tooling — they fail loudly when
+their dependencies are missing rather than silently degrading. Issues,
+contributions, and adversarial test cases welcome.
+
+Limits worth knowing about up front:
+
+* The data-flow / taint engine is intra- and inter-procedural for the
+  languages tree-sitter handles, but it does NOT model framework magic
+  (Spring AOP, Rails autoloading, JS dynamic imports) — assume some
+  blind spots there.
+* The WHATWG URL differential parser is an approximation, not a spec
+  implementation. It's tuned to surface the divergences that exploit
+  parser-confusion CVEs, not to be bit-perfect.
+* The dollar-budget cap (`LACUNA_BUDGET_USD`) is enforced via the
+  agent's own `token_cost_usd` accounting, not an Anthropic billing
+  query. Treat it as a soft cap.
 
 ## License
 
-See `LICENSE`.
+Apache-2.0. See [LICENSE](LICENSE).

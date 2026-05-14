@@ -29,11 +29,11 @@ clear extension points.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import subprocess
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -45,13 +45,39 @@ from mcp.types import TextContent, Tool
 
 server = Server("lacuna-recon")
 
-WORKSPACE = Path(os.environ.get("LACUNA_WORKSPACE", "/workspace"))
-MANIFEST_PATH = os.environ.get(
-    "LACUNA_MANIFEST_RESOLVED",
-    str(WORKSPACE / os.environ.get("LACUNA_MANIFEST", "app.lacuna.yaml")),
-)
-TOOL_CACHE = Path(os.environ.get("LACUNA_TOOL_CACHE_DIR", "/state/tool_results"))
-TOOL_CACHE.mkdir(parents=True, exist_ok=True)
+
+def _workspace() -> Path:
+    """Resolve the workspace lazily on each call.
+
+    Module-level resolution was a problem at test/import time when the
+    workspace doesn't yet exist (and on Windows where ``/workspace`` is
+    nonsensical). Callers that need the workspace path call this helper.
+    """
+    return Path(os.environ.get("LACUNA_WORKSPACE", "/workspace"))
+
+
+def _manifest_path() -> str:
+    explicit = os.environ.get("LACUNA_MANIFEST_RESOLVED")
+    if explicit:
+        return explicit
+    return str(
+        _workspace() / os.environ.get("LACUNA_MANIFEST", "app.lacuna.yaml")
+    )
+
+
+def _tool_cache_dir() -> Path:
+    p = Path(
+        os.environ.get("LACUNA_TOOL_CACHE_DIR", "/state/tool_results")
+    )
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# Back-compat module-level handles used by older call sites. Do NOT touch
+# the filesystem at import time — defer until first use.
+WORKSPACE = _workspace()
+MANIFEST_PATH = _manifest_path()
+TOOL_CACHE = _tool_cache_dir()
 
 # Language detection by extension
 LANG_EXT = {
@@ -75,27 +101,48 @@ SKIP_PATTERNS = re.compile(
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
+
+# Cache for ``_load_manifest`` keyed on (path, mtime). Avoids re-parsing the
+# YAML on every tool call.
+_MANIFEST_CACHE: dict[str, tuple[float, dict]] = {}
+
+
 def _load_manifest() -> dict:
-    if not Path(MANIFEST_PATH).exists():
+    path = _manifest_path()
+    p = Path(path)
+    if not p.exists():
         return {}
-    with open(MANIFEST_PATH) as f:
-        return yaml.safe_load(f) or {}
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    cached = _MANIFEST_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(p) as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    _MANIFEST_CACHE[path] = (mtime, data)
+    return data
 
 
 def _repo_paths() -> dict[str, Path]:
     """Map repo name → absolute path on disk."""
     out: dict[str, Path] = {}
     manifest = _load_manifest()
+    workspace = _workspace()
     for r in manifest.get("repos", []) or []:
         name = r.get("name")
         if not name:
             continue
-        p = WORKSPACE / name
+        p = workspace / name
         if p.exists():
             out[name] = p
     # Also include any workspace dir not in the manifest
-    if not out and WORKSPACE.exists():
-        for child in WORKSPACE.iterdir():
+    if not out and workspace.exists():
+        for child in workspace.iterdir():
             if child.is_dir() and child.name != ".lacuna":
                 out[child.name] = child
     return out
@@ -128,7 +175,7 @@ def _stash_payload(name: str, payload: Any) -> str:
     import hashlib
     body = json.dumps(payload, default=str).encode()
     digest = hashlib.sha256(body).hexdigest()[:16]
-    p = TOOL_CACHE / f"{name}-{digest}.json"
+    p = _tool_cache_dir() / f"{name}-{digest}.json"
     p.write_bytes(body)
     return str(p)
 
@@ -779,10 +826,8 @@ def _tool_app_inventory() -> list[TextContent]:
             lang = LANG_EXT.get(f.suffix.lower())
             if not lang:
                 continue
-            try:
+            with contextlib.suppress(OSError):
                 loc_by_lang[lang] += sum(1 for _ in f.open("rb"))
-            except OSError:
-                pass
         rows.append({
             "name": name,
             "path": str(path),
@@ -847,13 +892,11 @@ def _tool_language_stats(args: dict) -> list[TextContent]:
         if not lang:
             continue
         files_by_lang[lang] += 1
-        try:
+        with contextlib.suppress(OSError):
             loc_by_lang[lang] += sum(1 for _ in f.open("rb"))
-        except OSError:
-            pass
     return _ok({
-        "summary": f"top languages: " + ", ".join(
-            f"{l}({c})" for l, c in loc_by_lang.most_common(5)
+        "summary": "top languages: " + ", ".join(
+            f"{lang}({count})" for lang, count in loc_by_lang.most_common(5)
         ),
         "facets": {
             "files_by_lang": dict(files_by_lang),
@@ -917,23 +960,37 @@ def _tool_dependency_graph(args: dict) -> list[TextContent]:
         except OSError:
             pass
 
-    # pom.xml (lightweight regex parse — sufficient as a recon signal)
-    for pm in root.rglob("pom.xml"):
-        if SKIP_PATTERNS.search(str(pm)):
-            continue
-        try:
-            text = pm.read_text()
-        except OSError:
-            continue
-        for m in re.finditer(
-            r"<dependency>\s*<groupId>([^<]+)</groupId>\s*"
-            r"<artifactId>([^<]+)</artifactId>\s*<version>([^<]+)</version>",
-            text, re.DOTALL
-        ):
-            deps.append({"manifest": str(pm.relative_to(root)),
-                         "ecosystem": "maven",
-                         "name": f"{m.group(1)}:{m.group(2)}",
-                         "version": m.group(3), "scope": "runtime"})
+    # pom.xml — parse with defusedxml so XXE-style ``pom.xml`` files can't
+    # blow us up. Regex parsing missed dependencies where children were
+    # reordered (e.g. ``<scope>`` between ``<groupId>`` and ``<artifactId>``)
+    # and silently produced wrong manifests.
+    try:
+        from defusedxml import ElementTree as defused_et  # noqa: N813 — local handle
+    except ImportError:
+        defused_et = None
+    if defused_et is not None:
+        for pm in root.rglob("pom.xml"):
+            if SKIP_PATTERNS.search(str(pm)):
+                continue
+            try:
+                tree = defused_et.parse(str(pm))
+            except (OSError, defused_et.ParseError):
+                continue
+            r = tree.getroot()
+            ns = ""
+            if r.tag.startswith("{"):
+                ns = r.tag.split("}", 1)[0] + "}"
+            for dep in r.iter(f"{ns}dependency"):
+                gid = dep.findtext(f"{ns}groupId") or ""
+                aid = dep.findtext(f"{ns}artifactId") or ""
+                ver = dep.findtext(f"{ns}version") or ""
+                scope = dep.findtext(f"{ns}scope") or "runtime"
+                if not (gid and aid):
+                    continue
+                deps.append({"manifest": str(pm.relative_to(root)),
+                             "ecosystem": "maven",
+                             "name": f"{gid}:{aid}",
+                             "version": ver, "scope": scope})
 
     # Gemfile (very lightweight)
     for gf in root.rglob("Gemfile"):
@@ -973,6 +1030,18 @@ def _tool_dependency_graph(args: dict) -> list[TextContent]:
                                  "version": m.group(2), "scope": "runtime"})
 
     ecosystems = Counter(d["ecosystem"] for d in deps)
+
+    try:
+        from lacuna.kg import open_kg
+        kg = open_kg()
+        try:
+            kg.record_dependencies(repo_name, deps)
+        finally:
+            kg.close()
+    except Exception:
+        # KG persistence is best-effort — the tool still returns its results.
+        pass
+
     return _ok({
         "summary": f"{len(deps)} dependencies across {len(ecosystems)} ecosystems: " +
                    ", ".join(f"{e}({c})" for e, c in ecosystems.most_common()),
@@ -1027,7 +1096,7 @@ def _tool_secret_scan(args: dict) -> list[TextContent]:
     if repo_name not in repos:
         return _err(f"unknown repo: {repo_name}")
     root = repos[repo_name]
-    out_path = TOOL_CACHE / f"gitleaks-{repo_name}.json"
+    out_path = _tool_cache_dir() / f"gitleaks-{repo_name}.json"
     rc, _, err = _run(
         ["gitleaks", "detect", "--source", str(root),
          "--report-format", "json", "--report-path", str(out_path),
@@ -1226,15 +1295,40 @@ def _tool_authz_checks(args: dict) -> list[TextContent]:
     })
 
 
+# Source patterns are keyed by *category* (what kind of attacker input the
+# pattern represents), not by language. Each category aggregates patterns
+# across languages — that's the unit the data-flow engine actually cares
+# about.
 SOURCE_PATTERNS = {
-    "python": [
+    "http_request": [
         r"request\.(args|form|json|data|files|headers|cookies)",
         r"flask\.request\.",
-        r"input\(",
+        r"req\.(body|query|params|headers|cookies)",
+        r"r\.(URL\.Query|FormValue|PostFormValue|Header\.Get)",
+        r"\bctx\.Request\(\)",
     ],
-    "javascript": [r"req\.(body|query|params|headers|cookies)"],
-    "go":         [r"r\.(URL\.Query|FormValue|PostFormValue|Header\.Get)"],
+    "stdin": [
+        r"\binput\(",
+        r"\bsys\.stdin\.read",
+        r"\bos\.Stdin",
+        r"\bbufio\.NewReader\(os\.Stdin\)",
+    ],
+    "cli_args": [
+        r"\bsys\.argv\b",
+        r"\bos\.Args\b",
+        r"\bargparse\.",
+    ],
+    "env": [
+        r"\bos\.environ\b",
+        r"\bos\.getenv\(",
+        r"\bprocess\.env\b",
+    ],
+    "file_read": [
+        r"\bopen\(\s*[^,]+,\s*['\"]r",
+        r"\bfs\.readFile(Sync)?\(",
+    ],
 }
+
 SINK_PATTERNS = {
     "exec":     [r"\bsubprocess\.(run|call|Popen|check_output)", r"\bos\.system",
                   r"\bchild_process\.exec", r"\bRuntime\.getRuntime\(\)\.exec"],
@@ -1249,15 +1343,13 @@ SINK_PATTERNS = {
 
 
 def _tool_data_sources(args: dict) -> list[TextContent]:
-    return _scan_patterns(args, SOURCE_PATTERNS, label="source")
+    labelled = {f"source:{k}": v for k, v in SOURCE_PATTERNS.items()}
+    return _scan_patterns(args, labelled, label="source")
 
 
 def _tool_data_sinks(args: dict) -> list[TextContent]:
-    flat = {f"sink:{k}": v for k, vs in SINK_PATTERNS.items() for v in [vs]}
-    flat_single: dict[str, list[str]] = {}
-    for k, vs in SINK_PATTERNS.items():
-        flat_single[f"sink:{k}"] = vs
-    return _scan_patterns(args, flat_single, label="sink")
+    labelled = {f"sink:{k}": v for k, v in SINK_PATTERNS.items()}
+    return _scan_patterns(args, labelled, label="sink")
 
 
 def _scan_patterns(args: dict, patterns: dict[str, list[str]], label: str) -> list[TextContent]:
@@ -1565,8 +1657,8 @@ def _tool_code_excerpt(args: dict) -> list[TextContent]:
     start = max(0, line - ctx - 1)
     end = min(len(lines), line + ctx)
     excerpt = "\n".join(
-        f"{i + 1:>5}{'>' if i + 1 == line else ' '} {l}"
-        for i, l in enumerate(lines[start:end], start=start)
+        f"{i + 1:>5}{'>' if i + 1 == line else ' '} {ln}"
+        for i, ln in enumerate(lines[start:end], start=start)
     )
     return _ok({
         "summary": f"{file_rel}:{line} (±{ctx} lines)",
@@ -1580,9 +1672,9 @@ def _tool_ast_query(args: dict) -> list[TextContent]:
     if repo_name not in repos:
         return _err(f"unknown repo: {repo_name}")
     try:
-        from tree_sitter_languages import get_language, get_parser
+        from tree_sitter_language_pack import get_language, get_parser
     except ImportError:
-        return _err("tree-sitter-languages not installed")
+        return _err("tree-sitter-language-pack not installed")
     try:
         lang = get_language(args["language"])
         parser = get_parser(args["language"])
@@ -1749,7 +1841,7 @@ def _tool_data_flow_paths(args: dict) -> list[TextContent]:
         })
     return _ok({
         "summary": f"{len(hits)} taint paths found"
-                    + (f" (returning first 200; full set via payload_ref)" if payload_ref else ""),
+                    + (" (returning first 200; full set via payload_ref)" if payload_ref else ""),
         "handles": handles,
         "payload_ref": payload_ref,
         "facets": {
@@ -1823,7 +1915,12 @@ def _tool_custom_semgrep_scan(args: dict) -> list[TextContent]:
     if repo_name not in repos:
         return _err(f"unknown repo: {repo_name}")
     root = repos[repo_name]
-    # Reuse framework_detect and language_stats outputs to drive ruleset
+    # Reuse framework_detect and language_stats outputs to drive the
+    # ruleset. ``framework_detect`` returns a top-level ``handles`` list;
+    # ``language_stats`` returns ``facets.files_by_lang`` (a dict of
+    # ``language -> file_count``). The previous version of this function
+    # mistakenly read ``langs["handles"]`` and so silently scanned with no
+    # language rules at all.
     fw_text = _tool_framework_detect({"repo": repo_name})
     lang_text = _tool_language_stats({"repo": repo_name})
     try:
@@ -1834,12 +1931,22 @@ def _tool_custom_semgrep_scan(args: dict) -> list[TextContent]:
     detected_frameworks = [
         f["framework"] for f in (fw.get("handles") or [])
     ] if isinstance(fw, dict) else []
-    detected_languages = [
-        l.get("language", "").lower()
-        for l in (langs.get("handles") or [])
-    ] if isinstance(langs, dict) else []
+    detected_languages = list(
+        ((langs.get("facets") or {}).get("files_by_lang") or {}).keys()
+    ) if isinstance(langs, dict) else []
     ruleset = build_ruleset(root, detected_frameworks, detected_languages)
-    return _ok(run_custom_semgrep(root, ruleset))
+    result = run_custom_semgrep(root, ruleset)
+    handles = result.get("handles") or []
+    by_rule: Counter[str] = Counter(h.get("rule") or "?" for h in handles)
+    by_severity: Counter[str] = Counter(h.get("severity") or "?" for h in handles)
+    result["facets"] = {
+        "by_rule": dict(by_rule),
+        "by_severity": dict(by_severity),
+        "rules_run": result.get("rules_count", 0),
+        "frameworks_detected": detected_frameworks,
+        "languages_detected": detected_languages,
+    }
+    return _ok(result)
 
 
 # ─── new in v2: test coverage oracle ────────────────────────────────────────
@@ -1899,8 +2006,8 @@ def _tool_known_gadgets(args: dict) -> list[TextContent]:
 
 
 def _tool_trust_shadow_analyze() -> list[TextContent]:
-    from lacuna.tools.trust_shadow import analyze_application
     from lacuna.kg import Capability, open_kg
+    from lacuna.tools.trust_shadow import analyze_application
     repos = _repo_paths()
     if not repos:
         return _err("no repos configured")
@@ -1910,7 +2017,7 @@ def _tool_trust_shadow_analyze() -> list[TextContent]:
         kg = open_kg()
         # Index hints to capability IDs
         name_to_cap_id: dict[str, str] = {}
-        for repo_name, rep in result["per_repo"].items():
+        for _repo_name, rep in result["per_repo"].items():
             for cap in rep["capabilities"]:
                 c = Capability(
                     asset_kind=cap["asset_kind"],
@@ -1950,7 +2057,8 @@ def _tool_fetch_payload(args: dict) -> list[TextContent]:
     page = int(args.get("page", 0))
     page_size = int(args.get("page_size_bytes", 32000))
     p = Path(ref)
-    if not p.exists() or not str(p).startswith(str(TOOL_CACHE)):
+    cache_dir = _tool_cache_dir()
+    if not p.exists() or not str(p).startswith(str(cache_dir)):
         return _err(f"unknown payload_ref: {ref}")
     raw = p.read_text()
     start = page * page_size
@@ -1968,10 +2076,11 @@ def _tool_fetch_payload(args: dict) -> list[TextContent]:
 def _resolve_repo_root(repo_name: str) -> Path | None:
     """Find a repo directory by manifest name, falling back to workspace."""
     manifest = _load_manifest()
+    workspace = _workspace()
     for r in manifest.get("repos", []):
         if r.get("name") == repo_name:
-            return WORKSPACE / r.get("path", repo_name)
-    candidate = WORKSPACE / repo_name
+            return workspace / r.get("path", repo_name)
+    candidate = workspace / repo_name
     if candidate.is_dir():
         return candidate
     return None
@@ -2095,16 +2204,20 @@ def _facet_findings(findings: list[dict]) -> dict:
 
 
 def _extract_dep_hint(repo: str) -> dict:
-    """Pull dependency_graph hints from the KG to inform precision tools."""
+    """Pull dependency hints from the KG to inform precision tools.
+
+    The dependency catalog is populated by ``_tool_dependency_graph`` and
+    keyed on repo name. If no dependencies have been recorded yet (e.g. the
+    user ran a precision tool without running recon first) this returns an
+    empty dict — precision tools handle that case gracefully.
+    """
     try:
         from lacuna.kg import open_kg
         kg = open_kg()
-        rows = kg._conn.execute(
-            "SELECT name, version FROM dependencies WHERE repo = ? LIMIT 500",
-            (repo,),
-        ).fetchall()
-        kg.close()
-        return {r["name"]: r["version"] for r in rows if r["version"]}
+        try:
+            return kg.dependency_versions(repo)
+        finally:
+            kg.close()
     except Exception:
         return {}
 
@@ -2266,24 +2379,6 @@ def _tool_propagate_pattern(args: dict) -> list[TextContent]:
         "summary": result["summary"],
         "match_count": len(result["matches"]),
         "matches": result["matches"][:50],
-    })
-
-
-def _tool_fetch_payload(args: dict) -> list[TextContent]:
-    ref = args["payload_ref"]
-    page = int(args.get("page", 0))
-    page_size = int(args.get("page_size_bytes", 32000))
-    p = Path(ref)
-    if not p.exists() or not str(p).startswith(str(TOOL_CACHE)):
-        return _err(f"unknown payload_ref: {ref}")
-    raw = p.read_text()
-    start = page * page_size
-    end = start + page_size
-    return _ok({
-        "summary": f"payload chunk page={page} bytes={start}..{end} of {len(raw)}",
-        "chunk": raw[start:end],
-        "more": end < len(raw),
-        "next_page": page + 1 if end < len(raw) else None,
     })
 
 

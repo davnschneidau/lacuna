@@ -14,12 +14,12 @@ import sys
 
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
-from lacuna.kg import open_kg  # noqa: E402
+from lacuna.kg import open_kg
 
 
 def main() -> int:
     raw = sys.stdin.read()
-    hook_input = json.loads(raw) if raw.strip() else {}
+    json.loads(raw) if raw.strip() else {}
 
     kg = open_kg()
     status = kg.status_summary()

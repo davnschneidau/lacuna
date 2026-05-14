@@ -21,10 +21,11 @@ hunter-injection / hunter-xss agents can consume them uniformly.
 from __future__ import annotations
 
 import asyncio
-import json
-import re
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any
+
+from .. import __version__
 
 
 @dataclass
@@ -58,39 +59,68 @@ POSTMESSAGE_PAYLOADS = [
 
 
 async def _dom_xss_scenario(page, target_url: str) -> list[PlaywrightFinding]:
+    """Run DOM-XSS payloads against ``target_url``.
+
+    Listeners are registered ONCE per page (rather than per payload):
+    Playwright keeps every handler attached across navigations, so the
+    previous loop-and-register style accumulated N handlers per page,
+    fired the same console line N times, and leaked memory between
+    payloads. We use shared mutable buffers cleared at each iteration.
+    """
     findings: list[PlaywrightFinding] = []
-    for payload in DOM_XSS_PAYLOADS:
-        finding = PlaywrightFinding(
-            url=target_url, scenario="dom_xss",
-            confirmed=False, payload=payload,
-        )
+    console_msgs: list[str] = []
+    alert_msgs: list[str] = []
+    # Keep strong refs to dialog-dismiss tasks so they aren't GC'd before
+    # the dialog actually closes; ``asyncio.create_task`` returns a weakly
+    # referenced handle otherwise.
+    dismiss_tasks: set[asyncio.Task[Any]] = set()
+
+    def _on_console(m: Any) -> None:
+        console_msgs.append(m.text)
+
+    def _on_dialog(d: Any) -> None:
+        alert_msgs.append(d.message)
+        task = asyncio.create_task(d.dismiss())
+        dismiss_tasks.add(task)
+        task.add_done_callback(dismiss_tasks.discard)
+
+    page.on("console", _on_console)
+    page.on("dialog", _on_dialog)
+    try:
+        for payload in DOM_XSS_PAYLOADS:
+            console_msgs.clear()
+            alert_msgs.clear()
+            finding = PlaywrightFinding(
+                url=target_url, scenario="dom_xss",
+                confirmed=False, payload=payload,
+            )
+            with contextlib.suppress(Exception):
+                await page.evaluate("window.__lac_xss = undefined")
+            try:
+                full_url = target_url + payload
+                await page.goto(full_url, wait_until="networkidle",
+                                 timeout=15000)
+                marker = await page.evaluate(
+                    "() => typeof window.__lac_xss !== 'undefined'"
+                )
+                if marker or alert_msgs:
+                    finding.confirmed = True
+                    finding.evidence_markers = (
+                        ["window.__lac_xss set"] if marker else []
+                    ) + (
+                        [f"alert: {a}" for a in alert_msgs] if alert_msgs else []
+                    )
+            except Exception as e:
+                finding.console_errors.append(str(e)[:120])
+            finding.console_errors.extend(console_msgs[-5:])
+            finding.alerts.extend(alert_msgs)
+            findings.append(finding)
+    finally:
         try:
-            await page.evaluate("window.__lac_xss = undefined")
+            page.remove_listener("console", _on_console)
+            page.remove_listener("dialog", _on_dialog)
         except Exception:
             pass
-        # Hook console + alerts
-        console_msgs: list[str] = []
-        alert_msgs: list[str] = []
-        page.on("console", lambda m: console_msgs.append(m.text))
-        page.on("dialog", lambda d: (alert_msgs.append(d.message),
-                                      asyncio.create_task(d.dismiss())))
-        try:
-            full_url = target_url + payload
-            await page.goto(full_url, wait_until="networkidle",
-                             timeout=15000)
-            marker = await page.evaluate(
-                "() => typeof window.__lac_xss !== 'undefined'"
-            )
-            if marker or alert_msgs:
-                finding.confirmed = True
-                finding.evidence_markers = (
-                    ["window.__lac_xss set"] if marker else []
-                ) + ([f"alert: {a}" for a in alert_msgs] if alert_msgs else [])
-        except Exception as e:
-            finding.console_errors.append(str(e)[:120])
-        finding.console_errors.extend(console_msgs[-5:])
-        finding.alerts.extend(alert_msgs)
-        findings.append(finding)
     return findings
 
 
@@ -172,7 +202,7 @@ async def _run_async(
         browser = await pw.chromium.launch(headless=headless)
         context = await browser.new_context(
             ignore_https_errors=True,
-            user_agent="lacuna/2.0 (DAST; Playwright)",
+            user_agent=f"lacuna/{__version__} (DAST; Playwright)",
         )
         page = await context.new_page()
         for url in target_urls:

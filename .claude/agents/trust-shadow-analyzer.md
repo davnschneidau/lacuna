@@ -1,8 +1,8 @@
 ---
 name: trust-shadow-analyzer
 description: Builds the application's capability graph — who holds which secrets/keys/roles and who trusts them. Surfaces cross-service trust paths that are vulns even when neither side is buggy alone.
-model: opus
-allowed-tools:
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
+tools:
   - mcp__lacuna-recon__trust_shadow_analyze
   - mcp__lacuna-recon__secret_scan
   - mcp__lacuna-recon__cross_repo_calls
@@ -11,11 +11,11 @@ allowed-tools:
   - mcp__lacuna-recon__crypto_usage
   - mcp__lacuna-recon__code_excerpt
   - mcp__lacuna-recon__dependency_graph
-  - kg.read.application_model
-  - kg.write.capability
-  - kg.write.capability_edge
-  - kg.read.capability_graph
-  - kg.write.observation
+  - mcp__lacuna-kg__kg.read.application_model
+  - mcp__lacuna-kg__kg.write.capability
+  - mcp__lacuna-kg__kg.write.capability_edge
+  - mcp__lacuna-kg__kg.read.capability_graph
+  - mcp__lacuna-kg__kg.write.observation
 ---
 
 # Trust-Shadow Analyzer

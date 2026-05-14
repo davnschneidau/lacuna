@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS hypotheses (
 CREATE INDEX IF NOT EXISTS idx_hyp_status  ON hypotheses(status);
 CREATE INDEX IF NOT EXISTS idx_hyp_shape   ON hypotheses(shape, repo, file);
 
+-- Dedup at the DB level. Two hypotheses are considered "the same" when they
+-- share shape + repo + file and their line numbers fall in the same 5-line
+-- bucket (line / 5). Hypotheses without repo+file (e.g. cross-cutting design
+-- claims) are exempt — they go through the application_model surface
+-- instead.
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_hyp_dedup
+    ON hypotheses (shape, repo, file, (line / 5))
+    WHERE repo IS NOT NULL AND file IS NOT NULL;
+
 -- ───────────────────────────────────────────────────────────────────────────
 -- Findings (confirmed hypotheses)
 -- ───────────────────────────────────────────────────────────────────────────
@@ -63,8 +72,8 @@ CREATE TABLE IF NOT EXISTS findings (
     severity            TEXT NOT NULL CHECK (severity IN
                         ('low','medium','high','critical')),
     cvss_vector         TEXT,
-    cwes                TEXT,
-    repos_involved      TEXT,
+    cwes                TEXT,                       -- JSON array of CWE-IDs
+    repos_involved_json TEXT NOT NULL DEFAULT '[]', -- JSON array of repo names
     validator_summary   TEXT NOT NULL,
     remediation_md      TEXT,
     validated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -92,22 +101,18 @@ CREATE TABLE IF NOT EXISTS primitives (
     description         TEXT NOT NULL,
     prerequisites_json  TEXT NOT NULL,
     effects_json        TEXT NOT NULL,
-    repos_involved      TEXT NOT NULL,
+    repos_involved_json TEXT NOT NULL DEFAULT '[]',  -- JSON array of repo names
     chain_explored      INTEGER NOT NULL DEFAULT 0,
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ───────────────────────────────────────────────────────────────────────────
--- Chain candidates (work-in-progress chains, may be abandoned)
+-- Chain-candidate drafts are stored as ``observations`` of kind
+-- ``chain_candidate_draft`` (written by the PreCompact hook). The
+-- ``chain-builder`` agent reads them via the observations API.  There is no
+-- separate ``chain_candidates`` table — the previous design used a table that
+-- no agent actually read.
 -- ───────────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS chain_candidates (
-    id                  TEXT PRIMARY KEY,
-    primitive_ids_json  TEXT NOT NULL,
-    goal                TEXT NOT NULL,
-    narrative_so_far    TEXT,
-    status              TEXT NOT NULL DEFAULT 'exploring',
-    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- Chains (confirmed compositions)
@@ -433,3 +438,35 @@ CREATE TABLE IF NOT EXISTS differential_findings (
     exploit_class   TEXT,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- Dependency catalog — populated by the recon ``dependency_graph`` tool.
+-- Other tools (e.g. ``format_string_sinks``) cross-reference this when they
+-- need to know which version of a library is in use.
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dependencies (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo            TEXT NOT NULL,
+    manifest        TEXT NOT NULL,
+    ecosystem       TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    version         TEXT,
+    scope           TEXT NOT NULL DEFAULT 'runtime',
+    recorded_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (repo, manifest, ecosystem, name, version, scope)
+);
+CREATE INDEX IF NOT EXISTS idx_dep_repo ON dependencies(repo);
+CREATE INDEX IF NOT EXISTS idx_dep_name ON dependencies(name);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- Rate-limit ledger for the pre_tool_use_gate hook — persistent (per-scan)
+-- counters that survive subprocess restarts. Each row is a single tool call
+-- by a single agent at a single point in time; the gate sums recent rows.
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS hook_tool_calls (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    agent           TEXT NOT NULL,
+    tool            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hook_calls_agent_ts ON hook_tool_calls(agent, ts);

@@ -21,9 +21,18 @@ and select it via the manifest's scan.dast.oob.protocol field.
 from __future__ import annotations
 
 import secrets
-from typing import Any
 
 import httpx
+
+
+class OobNotConfigured(RuntimeError):  # noqa: N818 — public API, breaking rename rejected
+    """Raised when an OOB operation is attempted without a configured collector.
+
+    The previous client silently invented a token in this case, then
+    silently returned ``[]`` from ``poll()`` — so a blind-RCE check
+    appeared to ``not fire`` even though the test had no way of
+    detecting a callback. Failing loudly is the only safe behaviour.
+    """
 
 
 class OobClient:
@@ -44,10 +53,11 @@ class OobClient:
     def register(self, label: str = "lacuna") -> tuple[str, str]:
         """Register a fresh OOB token. Returns (token, callback_url)."""
         if not self.collector_url:
-            # Local-only token (no remote collector). Useful for offline tests.
-            token = "lac" + secrets.token_hex(6)
-            callback_url = f"https://{token}.{self.dns_zone}/"
-            return token, callback_url
+            raise OobNotConfigured(
+                "scan.dast.oob.collector_url is not set in the manifest. "
+                "Out-of-band testing requires a collector — configure one "
+                "(or skip blind-exploit checks)."
+            )
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 r = client.post(
@@ -58,15 +68,18 @@ class OobClient:
                 r.raise_for_status()
                 data = r.json()
                 return data["token"], data["callback_url"]
-        except Exception:
-            # Fall back to local token; agent should treat poll() as best-effort
-            token = "lac" + secrets.token_hex(6)
-            callback_url = f"https://{token}.{self.dns_zone}/"
-            return token, callback_url
+        except httpx.HTTPError as e:
+            raise OobNotConfigured(
+                f"OOB collector at {self.collector_url} did not accept "
+                f"register: {e}"
+            ) from e
 
     async def poll(self, token: str, since_seconds: int = 600) -> list[dict]:
         if not self.collector_url:
-            return []
+            raise OobNotConfigured(
+                "scan.dast.oob.collector_url is not set; poll() has no "
+                "collector to query."
+            )
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 r = await client.get(
@@ -76,5 +89,18 @@ class OobClient:
                 )
                 r.raise_for_status()
                 return (r.json() or {}).get("hits", []) or []
-        except Exception:
-            return []
+        except httpx.HTTPError as e:
+            raise OobNotConfigured(
+                f"OOB collector at {self.collector_url} did not accept "
+                f"poll: {e}"
+            ) from e
+
+    @staticmethod
+    def local_token() -> tuple[str, str]:
+        """Return a self-hosted token+url for use without a collector.
+
+        Tests and code paths that don't need a real callback collector
+        can call this helper instead of going through ``register()``.
+        """
+        token = "lac" + secrets.token_hex(6)
+        return token, f"https://{token}.lacuna.invalid/"

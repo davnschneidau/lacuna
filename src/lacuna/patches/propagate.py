@@ -15,9 +15,10 @@ import json
 import re
 import subprocess
 import tempfile
-import yaml
 from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 
 @dataclass
@@ -102,6 +103,16 @@ def _run_semgrep(
     return out
 
 
+_FALLBACK_SUFFIXES = frozenset({
+    ".py", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".java", ".go", ".js", ".ts", ".rb", ".cs",
+})
+_FALLBACK_SKIP_RE = re.compile(
+    r"[\\/](\.git|node_modules|\.venv|venv|__pycache__|dist|build|"
+    r"target|vendor)[\\/]"
+)
+
+
 def _run_regex_fallback(
     rule_yaml: str, repo_root: Path,
 ) -> list[PropagationMatch]:
@@ -119,34 +130,44 @@ def _run_regex_fallback(
         return []
 
     matches: list[PropagationMatch] = []
-    SKIP = re.compile(
-        r"/(\.git|node_modules|\.venv|venv|__pycache__|dist|build|"
-        r"target|vendor)/"
-    )
+    file_cache: dict[Path, str] = {}
+
+    def _read(path: Path) -> str | None:
+        if path in file_cache:
+            return file_cache[path]
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            return None
+        file_cache[path] = text
+        return text
+
+    candidate_files: list[Path] = []
+    for p in repo_root.rglob("*"):
+        if not p.is_file():
+            continue
+        if _FALLBACK_SKIP_RE.search(str(p)):
+            continue
+        if p.suffix not in _FALLBACK_SUFFIXES:
+            continue
+        candidate_files.append(p)
 
     for rule in rule_doc["rules"]:
         rule_id = rule.get("id", "unknown")
         pattern = rule.get("pattern", "")
         if not pattern or pattern == "...":
             continue
-        # Convert semgrep pattern → regex
         regex_src = _pattern_to_regex(pattern)
         try:
-            regex = re.compile(regex_src, re.MULTILINE)
+            # DOTALL so ``...`` (translated to ``.*?``) crosses newlines,
+            # MULTILINE so anchors line up with diff-style snippets.
+            regex = re.compile(regex_src, re.DOTALL | re.MULTILINE)
         except re.error:
             continue
 
-        for p in repo_root.rglob("*"):
-            if not p.is_file() or SKIP.search(str(p)):
-                continue
-            if p.suffix not in {
-                ".py", ".c", ".cc", ".cpp", ".h", ".hpp",
-                ".java", ".go", ".js", ".ts", ".rb", ".cs",
-            }:
-                continue
-            try:
-                text = p.read_text(errors="ignore")
-            except OSError:
+        for p in candidate_files:
+            text = _read(p)
+            if text is None:
                 continue
             for m in regex.finditer(text):
                 line_no = text[: m.start()].count("\n") + 1
@@ -166,27 +187,45 @@ def _pattern_to_regex(pattern: str) -> str:
     r"""Crude semgrep pattern → regex translator.
 
     Handles:
-      $METAVAR  → \w+
-      ...       → .*?
+      $METAVAR    → \w+ (any case — semgrep itself allows ``$x``)
+      $...METAVAR → .*? (ellipsis metavars match a span)
+      ...         → .*?
       literal text → escaped
+      whitespace runs collapse to ``\s+`` so indentation differences
+      between the patch and the haystack don't defeat the match.
     """
     parts: list[str] = []
     i = 0
-    while i < len(pattern):
+    n = len(pattern)
+    while i < n:
         ch = pattern[i]
-        if ch == "$" and i + 1 < len(pattern) and pattern[i+1].isupper():
-            # Read metavar name
+        if ch == "$" and i + 1 < n:
             j = i + 1
-            while j < len(pattern) and (pattern[j].isalnum() or pattern[j] == "_"):
-                j += 1
-            parts.append(r"\w+")
-            i = j
-            continue
+            # Optional ellipsis-metavar prefix: ``$...FOO`` and ``$..FOO``.
+            if pattern[j:j+3] == "...":
+                j += 3
+                while j < n and (pattern[j].isalnum() or pattern[j] == "_"):
+                    j += 1
+                parts.append(r".*?")
+                i = j
+                continue
+            if (pattern[j].isalpha() or pattern[j] == "_"):
+                while j < n and (pattern[j].isalnum() or pattern[j] == "_"):
+                    j += 1
+                parts.append(r"\w+")
+                i = j
+                continue
         if pattern[i:i+3] == "...":
-            parts.append(".*?")
+            parts.append(r".*?")
             i += 3
             continue
-        # Escape regex specials
+        if ch.isspace():
+            j = i + 1
+            while j < n and pattern[j].isspace():
+                j += 1
+            parts.append(r"\s+")
+            i = j
+            continue
         parts.append(re.escape(ch))
         i += 1
     return "".join(parts)

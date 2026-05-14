@@ -2,7 +2,7 @@
 name: hunter-crypto
 description: |
   Form hypotheses about cryptographic misuse. Crypto bugs are almost always misuse, not algorithm weakness.
-model: ${LACUNA_MODEL_OPUS}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

@@ -2,7 +2,7 @@
 name: hunter-authn-authz
 description: |
   Form hypotheses about authentication and authorization gaps. Particular attention to endpoints that change state on behalf of a user but check only authentication, not authorization.
-model: ${LACUNA_MODEL_OPUS}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

@@ -20,26 +20,43 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from jinja2 import Environment, StrictUndefined
+from jinja2 import Environment
 
+from .. import __version__
 from ..kg import open_kg
 from .sarif_emitter import emit_sarif
 
-VERSION = "3.0.0"
+# Single source of truth for the report header version.
+VERSION = __version__
 
 
 def _read_template(name: str) -> str:
     return (resources.files("lacuna.reports") / name).read_text()
 
 
-def _format_duration(start_str: str | None) -> str:
+def _format_duration(
+    start_str: str | None, end_str: str | None = None,
+) -> str:
+    """Format the scan duration.
+
+    Uses ``scan_finished_at`` when available so reports re-generated
+    from a finished scan show the same duration on every run. Falls back
+    to the current time only if the scan hasn't been marked finished.
+    """
     if not start_str:
         return "unknown"
     try:
         start = int(start_str)
     except ValueError:
         return start_str
-    seconds = int(time.time()) - start
+    if end_str:
+        try:
+            end = int(end_str)
+        except ValueError:
+            end = int(time.time())
+    else:
+        end = int(time.time())
+    seconds = max(0, end - start)
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}h {m:02d}m {s:02d}s"
@@ -135,7 +152,10 @@ def _exec_context(kg) -> dict[str, Any]:
         "scan_mode": kg.get_meta("scan_mode") or "sast",
         "repo_count": len(repos),
         "repo_names": repo_names,
-        "scan_duration": _format_duration(kg.get_meta("scan_started_at")),
+        "scan_duration": _format_duration(
+            kg.get_meta("scan_started_at"),
+            kg.get_meta("scan_finished_at"),
+        ),
         "bottom_line": bottom_line,
         "critical_count": status["findings_critical"],
         "high_count": status["findings_high"],
@@ -187,7 +207,10 @@ def _tech_context(kg) -> dict[str, Any]:
         "app_name": app_name,
         "scan_date": time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "scan_mode": kg.get_meta("scan_mode") or "sast",
-        "scan_duration": _format_duration(kg.get_meta("scan_started_at")),
+        "scan_duration": _format_duration(
+            kg.get_meta("scan_started_at"),
+            kg.get_meta("scan_finished_at"),
+        ),
         "manifest_path": kg.get_meta("manifest_path") or "?",
         "application_model_summary": am.get("summary_md", "*(not written)*"),
         "repo_count": len((am.get("facts", {}) or {}).get("repos", []) or []),
@@ -267,20 +290,21 @@ def _tech_context(kg) -> dict[str, Any]:
 # ─── v3 report-section helpers ─────────────────────────────────────────────
 
 def _collect_variant_clusters(kg, findings: list[dict]) -> list[dict]:
-    """Group findings into parent → children variant clusters."""
+    """Group findings into parent → children variant clusters.
+
+    The original implementation re-scanned ``kg.list_hypotheses()`` (a
+    SQL query that fans out into a Python list) inside a nested loop —
+    O(F·H·V). We materialise the hypothesis-by-id index once.
+    """
+    hypothesis_by_id: dict[str, dict] = {h["id"]: h for h in kg.list_hypotheses()}
     clusters: list[dict] = []
     for f in findings:
         variants = kg.list_variants_of(f["id"])
         if not variants:
             continue
-        # Resolve child hypothesis locations
         children: list[dict] = []
         for v in variants:
-            hyp = next(
-                (h for h in kg.list_hypotheses()
-                 if h["id"] == v["child_hyp_id"]),
-                None,
-            )
+            hyp = hypothesis_by_id.get(v["child_hyp_id"])
             if hyp:
                 children.append({
                     "hyp_id": v["child_hyp_id"],
@@ -419,6 +443,10 @@ def write_reports(reports_dir: Path) -> None:
     reports_dir.mkdir(parents=True, exist_ok=True)
     kg = open_kg()
     try:
+        # Pin the "scan finished" timestamp once so re-running the
+        # generator on a finished scan returns deterministic durations.
+        if not kg.get_meta("scan_finished_at"):
+            kg.set_meta("scan_finished_at", str(int(time.time())))
         env = Environment(
             keep_trailing_newline=True,
             trim_blocks=False, lstrip_blocks=False,

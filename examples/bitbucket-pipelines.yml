@@ -3,6 +3,10 @@
 # Place app.lacuna.yaml at the root of the primary repo. Pipelines runs from
 # that repo; Lacuna clones the other repos at scan time using the Bitbucket
 # credentials below.
+#
+# Before adopting this file: replace ``<your-registry>`` with your Docker
+# registry hostname (e.g. ``index.docker.io/myorg`` or ``ghcr.io/myorg``)
+# and verify the image tag matches the Lacuna release you intend to run.
 
 image: atlassian/default-image:4
 
@@ -20,7 +24,7 @@ pipelines:
           services: [docker]
           size: 2x   # 8 GB / 2 vCPU; bump to 4x for very large apps
           script:
-            - pipe: docker://your-registry.example.com/lacuna:1.0.0
+            - pipe: docker://<your-registry>/lacuna:3.0.0
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'
@@ -42,7 +46,7 @@ pipelines:
           size: 4x
           deployment: staging
           script:
-            - pipe: docker://your-registry.example.com/lacuna:1.0.0
+            - pipe: docker://<your-registry>/lacuna:3.0.0
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast+dast'
@@ -71,7 +75,7 @@ pipelines:
           services: [docker]
           size: 2x
           script:
-            - pipe: docker://your-registry.example.com/lacuna:1.0.0
+            - pipe: docker://<your-registry>/lacuna:3.0.0
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'

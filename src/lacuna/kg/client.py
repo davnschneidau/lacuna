@@ -6,40 +6,61 @@ compacted, but the KG is the source of truth. Everything important is here.
 
 Ephemeral mode: a fresh KG is created at the start of each scan. There is no
 cross-scan memory. To compare scans, archive the report artifacts.
+
+Concurrency model
+=================
+
+The KG is safe under cross-process concurrent writes (subagent spawns) via
+SQLite WAL + retry. ``add_hypothesis`` performs *atomic* dedup: SELECT and
+INSERT/UPDATE run in a single ``BEGIN IMMEDIATE`` transaction so two
+hunters racing to publish the same hypothesis can't both win. Multi-step
+writes that must be all-or-nothing (``add_finding`` + the implied
+``update_hypothesis_status``; ``record_fuzz_run`` + an immediate
+``record_fuzz_crash``) share one transaction.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
-import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from importlib import resources
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 
-def _ulid() -> str:
-    """Short unique ID. Not cryptographic — for human-readable references."""
+def _rand_id() -> str:
+    """Short, non-cryptographic random ID for human-readable references.
+
+    Note: this is *not* a ULID. Earlier revisions misnamed the function
+    ``_ulid`` despite returning a uuid4-derived hex slice with no
+    timestamp prefix. The kept-for-compat alias below preserves the old
+    name for any external callers that imported it.
+    """
     return uuid.uuid4().hex[:12]
 
 
+# Back-compat alias. New code should call ``_rand_id``.
+_ulid = _rand_id
+
+
 def hyp_id() -> str:
-    return f"hyp-{_ulid()}"
+    return f"hyp-{_rand_id()}"
 
 
 def find_id() -> str:
-    return f"fnd-{_ulid()}"
+    return f"fnd-{_rand_id()}"
 
 
 def prim_id() -> str:
-    return f"prim-{_ulid()}"
+    return f"prim-{_rand_id()}"
 
 
 def chain_id() -> str:
-    return f"chain-{_ulid()}"
+    return f"chain-{_rand_id()}"
 
 
 @dataclass
@@ -65,8 +86,8 @@ class Finding:
     title: str = ""
     severity: str = "medium"  # low|medium|high|critical
     cvss_vector: str | None = None
-    cwes: str | None = None
-    repos_involved: str = ""
+    cwes: list[str] | None = None
+    repos_involved: list[str] = field(default_factory=list)
     validator_summary: str = ""
     remediation_md: str | None = None
 
@@ -92,19 +113,19 @@ class Chain:
 
 
 def obs_id() -> str:
-    return f"obs-{_ulid()}"
+    return f"obs-{_rand_id()}"
 
 
 def cap_id() -> str:
-    return f"cap-{_ulid()}"
+    return f"cap-{_rand_id()}"
 
 
 def weird_id() -> str:
-    return f"weird-{_ulid()}"
+    return f"weird-{_rand_id()}"
 
 
 def flow_id() -> str:
-    return f"flow-{_ulid()}"
+    return f"flow-{_rand_id()}"
 
 
 @dataclass
@@ -214,6 +235,7 @@ class KG:
             (agent, event_type, json.dumps(payload, default=str), parent_event_id),
         )
         self._conn.commit()
+        assert cur.lastrowid is not None
         return int(cur.lastrowid)
 
     def recent_events(self, n: int = 50, event_type: str | None = None) -> list[dict]:
@@ -252,39 +274,81 @@ class KG:
     # ── hypotheses ──────────────────────────────────────────────────────────
 
     def add_hypothesis(self, h: Hypothesis) -> str:
-        # Fuzzy dedup: same shape+repo+file within +/- 5 lines → merge
-        if h.repo and h.file:
-            existing = self._conn.execute(
-                "SELECT id, seen_by FROM hypotheses "
-                "WHERE shape = ? AND repo = ? AND file = ? "
-                "AND ABS(COALESCE(line, 0) - COALESCE(?, 0)) <= 5",
-                (h.shape, h.repo, h.file, h.line),
-            ).fetchone()
-            if existing:
-                # Merge — record additional hunter as seen_by
-                seen_by = (existing["seen_by"] or "").split(",") if existing["seen_by"] else []
-                if h.hunter and h.hunter not in seen_by:
-                    seen_by.append(h.hunter)
-                self._conn.execute(
-                    "UPDATE hypotheses SET seen_by = ?, updated_at = CURRENT_TIMESTAMP "
-                    "WHERE id = ?",
-                    (",".join(seen_by), existing["id"]),
-                )
-                self._conn.commit()
-                return existing["id"]
+        """Insert or merge a hypothesis.
 
+        Dedup rule: same ``shape`` + ``repo`` + ``file`` within +/- 5 lines is
+        considered the same hypothesis. We rely on:
+
+        1. **The partial unique index** in ``schema.sql`` on
+           ``(shape, repo, file, line / 5)`` to make duplicate inserts
+           impossible at the DB layer.
+        2. **An INTEGRITY-ERROR retry** so two hunters who race to publish
+           the same hypothesis both end up merging into the same winner row.
+
+        Both steps run inside a single SQLite transaction so a crash mid-way
+        leaves the table consistent.
+        """
+        existing_id: str | None = None
         with self.tx() as c:
-            c.execute(
-                """INSERT INTO hypotheses
-                   (id, hunter, shape, repo, file, line, description,
-                    attacker_scenario, confidence, status, seen_by)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    h.id, h.hunter, h.shape, h.repo, h.file, h.line,
-                    h.description, h.attacker_scenario, h.confidence,
-                    h.status, h.hunter,
-                ),
-            )
+            if h.repo and h.file:
+                existing = c.execute(
+                    "SELECT id, seen_by FROM hypotheses "
+                    "WHERE shape = ? AND repo = ? AND file = ? "
+                    "AND ABS(COALESCE(line, 0) - COALESCE(?, 0)) <= 5",
+                    (h.shape, h.repo, h.file, h.line),
+                ).fetchone()
+                if existing:
+                    seen_by = (
+                        (existing["seen_by"] or "").split(",")
+                        if existing["seen_by"] else []
+                    )
+                    if h.hunter and h.hunter not in seen_by:
+                        seen_by.append(h.hunter)
+                    c.execute(
+                        "UPDATE hypotheses SET seen_by = ?, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (",".join(seen_by), existing["id"]),
+                    )
+                    existing_id = existing["id"]
+            if existing_id is None:
+                try:
+                    c.execute(
+                        """INSERT INTO hypotheses
+                           (id, hunter, shape, repo, file, line, description,
+                            attacker_scenario, confidence, status, seen_by)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            h.id, h.hunter, h.shape, h.repo, h.file, h.line,
+                            h.description, h.attacker_scenario, h.confidence,
+                            h.status, h.hunter,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # Partial unique index caught a race with a peer writer.
+                    # Re-do the lookup and merge into the winner.
+                    winner = c.execute(
+                        "SELECT id, seen_by FROM hypotheses "
+                        "WHERE shape = ? AND repo = ? AND file = ? "
+                        "AND ABS(COALESCE(line, 0) - COALESCE(?, 0)) <= 5",
+                        (h.shape, h.repo, h.file, h.line),
+                    ).fetchone()
+                    if winner:
+                        seen_by = (
+                            (winner["seen_by"] or "").split(",")
+                            if winner["seen_by"] else []
+                        )
+                        if h.hunter and h.hunter not in seen_by:
+                            seen_by.append(h.hunter)
+                        c.execute(
+                            "UPDATE hypotheses SET seen_by = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (",".join(seen_by), winner["id"]),
+                        )
+                        existing_id = winner["id"]
+                    else:
+                        raise
+        if existing_id is not None:
+            return existing_id
         self.append_event(h.hunter, "hypothesis_added", asdict(h))
         return h.id
 
@@ -302,6 +366,14 @@ class KG:
         q += " ORDER BY confidence DESC, created_at"
         return [dict(r) for r in self._conn.execute(q, args).fetchall()]
 
+    def get_hypothesis(self, hyp_id: str) -> dict | None:
+        """Direct fetch by ID. Use this instead of ``list_hypotheses()`` +
+        filter when you only need one hypothesis."""
+        r = self._conn.execute(
+            "SELECT * FROM hypotheses WHERE id = ?", (hyp_id,),
+        ).fetchone()
+        return dict(r) if r else None
+
     def update_hypothesis_status(
         self, hid: str, status: str, refutation_reason: str | None = None,
         finding_id: str | None = None,
@@ -316,19 +388,32 @@ class KG:
     # ── findings & evidence ─────────────────────────────────────────────────
 
     def add_finding(self, f: Finding) -> str:
+        """Insert a finding and confirm its parent hypothesis atomically.
+
+        Both writes run inside one transaction. If either fails the other is
+        rolled back so we never have a hypothesis pointing at a finding-id
+        that doesn't exist (or vice-versa).
+        """
+        cwes_json = json.dumps(f.cwes) if f.cwes else None
+        repos_json = json.dumps(list(f.repos_involved or []))
         with self.tx() as c:
             c.execute(
                 """INSERT INTO findings
                    (id, hypothesis_id, title, severity, cvss_vector, cwes,
-                    repos_involved, validator_summary, remediation_md)
+                    repos_involved_json, validator_summary, remediation_md)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
                 (
                     f.id, f.hypothesis_id, f.title, f.severity, f.cvss_vector,
-                    f.cwes, f.repos_involved, f.validator_summary, f.remediation_md,
+                    cwes_json, repos_json, f.validator_summary, f.remediation_md,
                 ),
             )
-        if f.hypothesis_id:
-            self.update_hypothesis_status(f.hypothesis_id, "confirmed", finding_id=f.id)
+            if f.hypothesis_id:
+                c.execute(
+                    "UPDATE hypotheses SET status = 'confirmed', "
+                    "finding_id = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (f.id, f.hypothesis_id),
+                )
         self.append_event("validator", "finding_added", asdict(f))
         return f.id
 
@@ -344,7 +429,35 @@ class KG:
                 "CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 "
                 "WHEN 'medium' THEN 3 ELSE 4 END, validated_at DESC"
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._inflate_finding(dict(r)) for r in rows]
+
+    def get_finding(self, finding_id: str) -> dict | None:
+        """Direct fetch by ID."""
+        r = self._conn.execute(
+            "SELECT * FROM findings WHERE id = ?", (finding_id,),
+        ).fetchone()
+        return self._inflate_finding(dict(r)) if r else None
+
+    @staticmethod
+    def _inflate_finding(row: dict) -> dict:
+        """Decode JSON-stored columns back to Python objects for callers."""
+        if "cwes" in row and isinstance(row["cwes"], str):
+            try:
+                row["cwes"] = json.loads(row["cwes"]) if row["cwes"] else []
+            except (TypeError, json.JSONDecodeError):
+                # Legacy comma-string fallback
+                row["cwes"] = [
+                    s for s in (row["cwes"] or "").split(",") if s
+                ]
+        if "repos_involved_json" in row:
+            try:
+                row["repos_involved"] = (
+                    json.loads(row["repos_involved_json"])
+                    if row["repos_involved_json"] else []
+                )
+            except (TypeError, json.JSONDecodeError):
+                row["repos_involved"] = []
+        return row
 
     def attach_evidence(self, finding_id: str, kind: str, payload_path: str) -> None:
         with self.tx() as c:
@@ -367,12 +480,12 @@ class KG:
             c.execute(
                 """INSERT INTO primitives
                    (id, finding_id, name, description,
-                    prerequisites_json, effects_json, repos_involved)
+                    prerequisites_json, effects_json, repos_involved_json)
                    VALUES (?,?,?,?,?,?,?)""",
                 (
                     p.id, p.finding_id, p.name, p.description,
                     json.dumps(p.prerequisites), json.dumps(p.effects),
-                    ",".join(p.repos_involved),
+                    json.dumps(list(p.repos_involved or [])),
                 ),
             )
         self.append_event("validator", "primitive_added", asdict(p))
@@ -381,18 +494,40 @@ class KG:
     def list_primitives(self) -> list[Primitive]:
         out: list[Primitive] = []
         for r in self._conn.execute("SELECT * FROM primitives ORDER BY created_at"):
+            try:
+                repos = json.loads(r["repos_involved_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                repos = []
             out.append(Primitive(
                 id=r["id"], finding_id=r["finding_id"] or "", name=r["name"],
                 description=r["description"],
                 prerequisites=json.loads(r["prerequisites_json"]),
                 effects=json.loads(r["effects_json"]),
-                repos_involved=(r["repos_involved"] or "").split(","),
+                repos_involved=repos,
             ))
         return out
 
     def mark_primitive_explored(self, pid: str) -> None:
         with self.tx() as c:
             c.execute("UPDATE primitives SET chain_explored = 1 WHERE id = ?", (pid,))
+
+    def get_primitive(self, pid: str) -> Primitive | None:
+        r = self._conn.execute(
+            "SELECT * FROM primitives WHERE id = ?", (pid,),
+        ).fetchone()
+        if not r:
+            return None
+        try:
+            repos = json.loads(r["repos_involved_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            repos = []
+        return Primitive(
+            id=r["id"], finding_id=r["finding_id"] or "", name=r["name"],
+            description=r["description"],
+            prerequisites=json.loads(r["prerequisites_json"]),
+            effects=json.loads(r["effects_json"]),
+            repos_involved=repos,
+        )
 
     def unexplored_primitive_count(self) -> int:
         return int(self._conn.execute(
@@ -424,6 +559,18 @@ class KG:
                 narrative_md=r["narrative_md"],
             ))
         return out
+
+    def get_chain(self, cid: str) -> Chain | None:
+        r = self._conn.execute(
+            "SELECT * FROM chains WHERE id = ?", (cid,),
+        ).fetchone()
+        if not r:
+            return None
+        return Chain(
+            id=r["id"], primitive_ids=json.loads(r["primitive_ids_json"]),
+            goal=r["goal"], combined_severity=r["combined_severity"],
+            narrative_md=r["narrative_md"],
+        )
 
     # ── exit criteria ───────────────────────────────────────────────────────
 
@@ -802,7 +949,7 @@ class KG:
         detail_md: str, evidence: dict, confidence: float,
         cve_hint: str | None = None,
     ) -> str:
-        pf_id = f"pf-{_ulid()}"
+        pf_id = f"pf-{_rand_id()}"
         with self.tx() as c:
             c.execute(
                 """INSERT INTO precision_findings
@@ -846,7 +993,7 @@ class KG:
         build_log_path: str | None, binaries: list[dict],
         warnings: list[dict], duration_s: int,
     ) -> str:
-        sb_id = f"sb-{_ulid()}"
+        sb_id = f"sb-{_rand_id()}"
         with self.tx() as c:
             c.execute(
                 """INSERT INTO sanitizer_builds
@@ -876,8 +1023,15 @@ class KG:
         self, repo: str, function_qual: str, binary_path: str,
         timeout_s: int, executions: int | None, coverage_pct: float | None,
         status: str, triggered_by: str | None, duration_s: int,
+        crashes: list[dict] | None = None,
     ) -> str:
-        fr_id = f"fr-{_ulid()}"
+        """Record a fuzz run and (atomically) any crashes it discovered.
+
+        Pass ``crashes=[{"asan_kind": ..., "crash_stack": [...], "input_path":
+        ..., "minimized_input_path": ..., "asan_log_path": ...}, ...]`` to
+        insert the run and the crashes in a single transaction.
+        """
+        fr_id = f"fr-{_rand_id()}"
         with self.tx() as c:
             c.execute(
                 """INSERT INTO fuzz_runs
@@ -887,6 +1041,21 @@ class KG:
                 (fr_id, repo, function_qual, binary_path, timeout_s,
                  executions, coverage_pct, status, triggered_by, duration_s),
             )
+            for crash in (crashes or []):
+                c.execute(
+                    """INSERT INTO fuzz_crashes
+                       (id, fuzz_run_id, asan_kind, crash_stack_json,
+                        input_path, minimized_input_path, asan_log_path)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        f"fc-{_rand_id()}", fr_id,
+                        crash.get("asan_kind"),
+                        json.dumps(crash.get("crash_stack", [])),
+                        crash.get("input_path", ""),
+                        crash.get("minimized_input_path"),
+                        crash.get("asan_log_path"),
+                    ),
+                )
         return fr_id
 
     def record_fuzz_crash(
@@ -894,7 +1063,12 @@ class KG:
         crash_stack: list[str], input_path: str,
         minimized_input_path: str | None, asan_log_path: str | None,
     ) -> str:
-        c_id = f"fc-{_ulid()}"
+        """Record a crash for an *existing* fuzz run.
+
+        Prefer the ``crashes=`` kwarg on :py:meth:`record_fuzz_run` when the
+        crashes are discovered as part of the same run — that path is atomic.
+        """
+        c_id = f"fc-{_rand_id()}"
         with self.tx() as c:
             c.execute(
                 """INSERT INTO fuzz_crashes
@@ -936,7 +1110,7 @@ class KG:
         before_pattern: str | None, after_pattern: str | None,
         essence_md: str | None, confidence: float,
     ) -> str:
-        pr_id = f"pr-{_ulid()}"
+        pr_id = f"pr-{_rand_id()}"
         with self.tx() as c:
             c.execute(
                 """INSERT INTO patch_rules
@@ -992,13 +1166,75 @@ class KG:
             ).fetchall()
         ]
 
+    # ─── v3: dependency catalog ─────────────────────────────────────────────
+
+    def record_dependencies(
+        self, repo: str, deps: list[dict[str, Any]],
+    ) -> int:
+        """Bulk-record dependencies for ``repo``. Idempotent (UPSERT on uniq)."""
+        if not deps:
+            return 0
+        rows = [
+            (
+                repo,
+                str(d.get("manifest") or ""),
+                str(d.get("ecosystem") or ""),
+                str(d.get("name") or ""),
+                (d.get("version") or "") or None,
+                str(d.get("scope") or "runtime"),
+            )
+            for d in deps
+            if d.get("name")
+        ]
+        with self.tx() as c:
+            c.executemany(
+                """INSERT OR IGNORE INTO dependencies
+                   (repo, manifest, ecosystem, name, version, scope)
+                   VALUES (?,?,?,?,?,?)""",
+                rows,
+            )
+        return len(rows)
+
+    def dependency_versions(self, repo: str) -> dict[str, str]:
+        """Return ``{name: version}`` for the given repo, only entries with
+        a version set. Used by precision tools as a recon hint.
+        """
+        rows = self._conn.execute(
+            "SELECT name, version FROM dependencies "
+            "WHERE repo = ? AND version IS NOT NULL AND version != '' LIMIT 5000",
+            (repo,),
+        ).fetchall()
+        return {r["name"]: r["version"] for r in rows}
+
+    # ─── v3: hook tool-call ledger ──────────────────────────────────────────
+
+    def record_hook_tool_call(self, agent: str, tool: str) -> None:
+        """Append a row for the pre_tool_use_gate rate limiter."""
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO hook_tool_calls (agent, tool) VALUES (?, ?)",
+                (agent, tool),
+            )
+
+    def count_hook_tool_calls(
+        self, agent: str, window_seconds: int,
+    ) -> int:
+        """Count this agent's tool calls in the last ``window_seconds``."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM hook_tool_calls "
+            "WHERE agent = ? "
+            "AND ts >= datetime('now', ?)",
+            (agent, f"-{int(window_seconds)} seconds"),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
     # ─── v3: differential findings ──────────────────────────────────────────
 
     def add_differential_finding(
         self, protocol: str, input_hex: str, parser_results: dict,
         divergence: bool, exploit_class: str | None,
     ) -> str:
-        df_id = f"df-{_ulid()}"
+        df_id = f"df-{_rand_id()}"
         with self.tx() as c:
             c.execute(
                 """INSERT INTO differential_findings

@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 
-
 GOPHERUS_BIN = os.environ.get("GOPHERUS_BIN", "gopherus")
 SUPPORTED_EXPLOITS = [
     "redis", "mongodb", "mysql", "postgres", "memcached",

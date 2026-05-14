@@ -17,6 +17,8 @@ from pathlib import Path
 
 import click
 
+from . import __version__
+
 
 @click.group()
 def cli() -> None:
@@ -80,7 +82,7 @@ def report(reports_dir: Path) -> None:
 @cli.command()
 def version() -> None:
     """Print Lacuna version."""
-    click.echo("Lacuna 1.0.0")
+    click.echo(f"Lacuna {__version__}")
 
 
 if __name__ == "__main__":

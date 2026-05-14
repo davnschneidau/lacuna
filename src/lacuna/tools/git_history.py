@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections import Counter
 from pathlib import Path
-
 
 SECURITY_RELEVANT_KEYWORDS = re.compile(
     r"\b(CVE-\d{4}-\d+|security|vuln(?:erability)?|exploit|sanitiz|inject(?:ion)?|"
@@ -109,10 +107,10 @@ def recent_security_commits(
         sha, author, ts, subject = parts
         if SECURITY_RELEVANT_KEYWORDS.search(subject):
             # Also fetch the changed files for this commit (cheap)
-            rc2, out2, _ = _run_git(repo_root, [
+            _rc2, out2, _ = _run_git(repo_root, [
                 "show", "--name-only", "--pretty=format:", sha,
             ])
-            files_changed = [l for l in out2.splitlines() if l.strip()]
+            files_changed = [ln for ln in out2.splitlines() if ln.strip()]
             matches.append({
                 "sha": sha[:12], "author": author,
                 "ts": int(ts) if ts.isdigit() else ts,

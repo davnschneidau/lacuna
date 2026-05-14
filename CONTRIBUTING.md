@@ -68,5 +68,10 @@ returns a well-formed response shape.
 ## Reporting security issues
 
 Lacuna scans for security bugs. It will also have them. If you find a
-security issue in Lacuna itself, please email security@your-org.example
-rather than opening a public issue.
+security issue in Lacuna itself, open a **private** advisory through
+the repository's GitHub Security tab (Security → Advisories →
+"Report a vulnerability") rather than a public issue. If GitHub
+Security advisories are unavailable for the project mirror you're
+working against, attach the disclosure to a draft PR titled
+`SECURITY: <short description>` and mark it as a draft so a
+maintainer can pick it up before it becomes visible to the public.

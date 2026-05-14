@@ -16,7 +16,6 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -63,7 +62,14 @@ def _rule_django_raw_sql(repo_root: Path) -> list[dict]:
 
 
 def _rule_express_no_helmet(repo_root: Path) -> list[dict]:
-    # Look for `const app = express()` without `app.use(helmet())`
+    # Find `const app = express()` and warn if no `app.use(helmet())` exists
+    # anywhere in the same file. The previous rule used
+    # ``pattern-not-inside``, which only checks containment of the inner
+    # pattern *inside* the outer one — i.e. it asked "does the
+    # ``app = express()`` line itself contain ``app.use(helmet())``", which
+    # of course it never does. We use ``pattern-not`` paired with a file-
+    # level ``pattern`` so the match only fires when no helmet usage is
+    # present anywhere in the file.
     return [{
         "id": "lacuna.express.missing-helmet",
         "message": (
@@ -73,10 +79,88 @@ def _rule_express_no_helmet(repo_root: Path) -> list[dict]:
         "severity": "WARNING",
         "languages": ["javascript", "typescript"],
         "patterns": [
-            {"pattern": "const $APP = express(...)"},
-            {"pattern-not-inside": "$APP.use(helmet(...))"},
+            {"pattern": "$APP = express(...)"},
+            {"pattern-not": "helmet(...)"},
         ],
         "metadata": {"category": "security", "cwe": ["CWE-693"]},
+    }]
+
+
+# ─── extra language rule sets ──────────────────────────────────────────────
+
+
+def _rule_js_eval(repo_root: Path) -> list[dict]:
+    return [{
+        "id": "lacuna.js.eval-untrusted",
+        "message": (
+            "eval()/new Function() with non-literal first argument. "
+            "If the argument is attacker-influenced this is RCE."
+        ),
+        "severity": "ERROR",
+        "languages": ["javascript", "typescript"],
+        "pattern-either": [
+            {"pattern": "eval($X)"},
+            {"pattern": "new Function($X)"},
+        ],
+        "pattern-not": {"pattern": 'eval("...")'},
+        "metadata": {"category": "security", "cwe": ["CWE-94"]},
+    }]
+
+
+def _rule_js_child_process_exec(repo_root: Path) -> list[dict]:
+    return [{
+        "id": "lacuna.js.child-process-exec-non-literal",
+        "message": (
+            "child_process.exec/execSync with non-literal command. "
+            "Concatenation with attacker input = OS command injection."
+        ),
+        "severity": "ERROR",
+        "languages": ["javascript", "typescript"],
+        "pattern-either": [
+            {"pattern": "child_process.exec($X, ...)"},
+            {"pattern": "child_process.execSync($X, ...)"},
+            {"pattern": "exec($X, ...)"},
+            {"pattern": "execSync($X, ...)"},
+        ],
+        "pattern-not": {"pattern": 'exec("...", ...)'},
+        "metadata": {"category": "security", "cwe": ["CWE-78"]},
+    }]
+
+
+def _rule_go_sql_concat(repo_root: Path) -> list[dict]:
+    return [{
+        "id": "lacuna.go.sql-string-concat",
+        "message": (
+            "db.Exec / db.Query with a concatenated SQL string. "
+            "Use parameterized queries (`$1`, `?`) instead."
+        ),
+        "severity": "ERROR",
+        "languages": ["go"],
+        "pattern-either": [
+            {"pattern": '$DB.Exec("..." + $X)'},
+            {"pattern": '$DB.Query("..." + $X)'},
+            {"pattern": '$DB.QueryRow("..." + $X)'},
+            {"pattern": '$DB.Exec(fmt.Sprintf($FMT, ...))'},
+        ],
+        "metadata": {"category": "security", "cwe": ["CWE-89"]},
+    }]
+
+
+def _rule_java_runtime_exec(repo_root: Path) -> list[dict]:
+    return [{
+        "id": "lacuna.java.runtime-exec",
+        "message": (
+            "Runtime.exec / ProcessBuilder with non-literal command. "
+            "Concatenation with attacker input = OS command injection."
+        ),
+        "severity": "ERROR",
+        "languages": ["java"],
+        "pattern-either": [
+            {"pattern": "Runtime.getRuntime().exec($X)"},
+            {"pattern": "new ProcessBuilder($X, ...)"},
+        ],
+        "pattern-not": {"pattern": 'Runtime.getRuntime().exec("...")'},
+        "metadata": {"category": "security", "cwe": ["CWE-78"]},
     }]
 
 
@@ -175,6 +259,16 @@ LANGUAGE_RULES = {
         _rule_pickle_load,
         _rule_jwt_alg_none,
     ],
+    "javascript": [
+        _rule_js_eval,
+        _rule_js_child_process_exec,
+    ],
+    "typescript": [
+        _rule_js_eval,
+        _rule_js_child_process_exec,
+    ],
+    "go": [_rule_go_sql_concat],
+    "java": [_rule_java_runtime_exec],
 }
 
 

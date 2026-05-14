@@ -1,8 +1,8 @@
 {
   "_comment": "Lacuna's Claude Code configuration. Wires hooks, configures context management, declares permitted tools.",
 
-  "model": "${LACUNA_MODEL_OPUS}",
-  "smallFastModel": "${LACUNA_MODEL_HAIKU}",
+  "model": "${LACUNA_MODEL_OPUS:-claude-opus-4-7}",
+  "smallFastModel": "${LACUNA_MODEL_HAIKU:-claude-haiku-4-5}",
 
   "hooks": {
     "SessionStart": [
@@ -71,7 +71,7 @@
   },
 
   "subagents": {
-    "_comment": "Subagent contracts: token caps applied on spawn and on return. Hunter inputs are capped tight; chain-builder runs on a primitives-only context. v2 adds per-phase parallelism: recon-per-repo, hunter × repo matrix, validators concurrent, DAST per allowed-host, skeptic per finding.",
+    "_comment": "Subagent contracts: token caps applied on spawn and on return. Hunter inputs are capped tight; chain-builder runs on a primitives-only context. v2 adds per-phase parallelism: recon-per-repo, hunter × repo matrix, validators concurrent, DAST per allowed-host, skeptic per finding. NOTE: LACUNA_MAX_PARALLEL_SUBAGENTS in the harness env, if set, OVERRIDES subagents.maxParallel below. The setting here is a static default; the env var is the runtime knob.",
     "maxParallel": 8,
     "perPhaseParallel": {
       "recon": 8,

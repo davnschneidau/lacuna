@@ -25,14 +25,15 @@ Tools:
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import os
 import re
-import secrets
 import sys
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -42,23 +43,48 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from lacuna import __version__ as _LACUNA_VERSION  # noqa: N812 — single source of truth
+
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
-from lacuna.kg import open_kg  # noqa: E402
-from lacuna.dast.payloads import payloads_for_class  # noqa: E402
-from lacuna.dast.oob_client import OobClient  # noqa: E402
+from lacuna.dast.oob_client import OobClient, OobNotConfigured
+from lacuna.dast.payloads import payloads_for_class
 
 server = Server("lacuna-dast")
 
-WORKSPACE = Path(os.environ.get("LACUNA_WORKSPACE", "/workspace"))
-MANIFEST_PATH = os.environ.get(
-    "LACUNA_MANIFEST_RESOLVED",
-    str(WORKSPACE / os.environ.get("LACUNA_MANIFEST", "app.lacuna.yaml")),
-)
-EVIDENCE_DIR = Path(os.environ.get("LACUNA_EVIDENCE_DIR", "/state/evidence"))
-EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-TOOL_CACHE = Path(os.environ.get("LACUNA_TOOL_CACHE_DIR", "/state/tool_results"))
-TOOL_CACHE.mkdir(parents=True, exist_ok=True)
+
+def _workspace() -> Path:
+    return Path(os.environ.get("LACUNA_WORKSPACE", "/workspace"))
+
+
+def _manifest_path() -> str:
+    return os.environ.get(
+        "LACUNA_MANIFEST_RESOLVED",
+        str(_workspace() / os.environ.get("LACUNA_MANIFEST", "app.lacuna.yaml")),
+    )
+
+
+def _evidence_dir() -> Path:
+    p = Path(os.environ.get("LACUNA_EVIDENCE_DIR", "/state/evidence"))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _tool_cache_dir() -> Path:
+    p = Path(os.environ.get("LACUNA_TOOL_CACHE_DIR", "/state/tool_results"))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# Back-compat module-level handles. Each function that uses these resolves
+# them lazily via the helper above so the filesystem isn't touched at import.
+
+# RFC 2606 reserves ``.invalid`` for canary hostnames that are guaranteed
+# never to resolve. Using ``.example`` (the previous placeholder) is wrong
+# because RFC 2606 says ``.example`` *must* resolve to a documentation
+# host, which means a smuggling/host-injection test could accidentally
+# emit a real DNS query for it.
+_CANARY_HOST = "lacuna-evil.invalid"
 
 # In-memory state for the lifetime of this server process
 _SESSION_COOKIES: dict[str, dict] = {}  # session_name → cookie jar
@@ -75,11 +101,28 @@ def _err(msg: str) -> list[TextContent]:
     return _ok({"error": msg})
 
 
+_MANIFEST_CACHE: dict[str, tuple[float, dict]] = {}
+
+
 def _load_manifest() -> dict:
-    if not Path(MANIFEST_PATH).exists():
+    path = _manifest_path()
+    p = Path(path)
+    if not p.exists():
         return {}
-    with open(MANIFEST_PATH) as f:
-        return yaml.safe_load(f) or {}
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    cached = _MANIFEST_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(p) as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    _MANIFEST_CACHE[path] = (mtime, data)
+    return data
 
 
 def _dast_config() -> dict:
@@ -106,17 +149,20 @@ def _check_target(url: str) -> str | None:
 
 
 def _glob_match(pattern: str, host: str) -> bool:
-    """Simple glob: *.example.com matches a.example.com."""
-    if pattern.startswith("*."):
-        suffix = pattern[1:]
-        return host.endswith(suffix) and host != suffix.lstrip(".")
-    return pattern == host
+    """Glob a hostname against a pattern.
+
+    Uses :mod:`fnmatch`, which supports ``*``, ``?`` and bracket character
+    classes — what users actually expect from a glob. The earlier
+    hand-rolled matcher only handled ``*.x.y`` and silently mis-matched
+    everything else (notably the apex domain).
+    """
+    return fnmatch.fnmatch(host, pattern)
 
 
 def _materialize_trace(prefix: str, request: dict, response: dict) -> str:
-    """Write request+response to /state/evidence and return the directory path."""
+    """Write request+response to the evidence dir and return the path."""
     eid = uuid.uuid4().hex[:12]
-    ev_dir = EVIDENCE_DIR / f"{prefix}-{eid}"
+    ev_dir = _evidence_dir() / f"{prefix}-{eid}"
     ev_dir.mkdir(parents=True, exist_ok=True)
     (ev_dir / "request.json").write_text(json.dumps(request, indent=2, default=str))
     (ev_dir / "response.json").write_text(json.dumps(response, indent=2, default=str))
@@ -145,7 +191,9 @@ async def _do_request(
     merged_headers = {**sess_headers, **(headers or {})}
     merged_cookies = {**sess_cookies, **(cookies or {})}
     merged_headers.setdefault(
-        "User-Agent", "Lacuna/1.0 (security scan; +https://your-org.example)"
+        "User-Agent",
+        f"Lacuna/{_LACUNA_VERSION} (security scan; "
+        "+https://github.com/davnschneidau/lacuna)",
     )
 
     request_blob = {
@@ -166,7 +214,7 @@ async def _do_request(
         body_bytes = resp.content
         # Persist body — it can be large
         body_hash = hashlib.sha256(body_bytes).hexdigest()[:16]
-        body_path = TOOL_CACHE / f"resp-body-{body_hash}.bin"
+        body_path = _tool_cache_dir() / f"resp-body-{body_hash}.bin"
         if not body_path.exists():
             body_path.write_bytes(body_bytes)
 
@@ -377,10 +425,15 @@ async def list_tools() -> list[Tool]:
         ), inputSchema={
             "type": "object",
             "properties": {
-                "exploit": {"type": "string"},
-                "command": {"type": "string"},
+                "exploit": {"type": "string",
+                              "enum": ["Redis", "MySQL", "Memcached",
+                                       "FastCGI", "PHPFPM", "SMTP", "Zabbix"]},
+                "command": {"type": "string",
+                              "description": "Command/payload to run on the "
+                                              "back-end service. Required for "
+                                              "every gopherus exploit."},
             },
-            "required": ["exploit"],
+            "required": ["exploit", "command"],
         }),
 
         # ─── v3 Layer 3: dynamic confirmation oracles ─────────────────────
@@ -545,13 +598,19 @@ async def _t_auth_login(args: dict) -> list[TextContent]:
 
     if kind == "oauth-password-grant":
         token_url = flow["token_url"]
+        # The previous one-liner ``a and b or ""`` collapses to ``""`` if
+        # ``a`` is set but ``b`` resolves to an empty string — a real foot-
+        # gun. Use a clear two-line resolution instead.
+        client_secret_env = flow.get("client_secret_env")
+        client_secret = (
+            os.environ.get(client_secret_env, "") if client_secret_env else ""
+        )
         body = {
             "grant_type": "password",
             "username": os.environ.get(flow.get("username_env", ""), ""),
             "password": os.environ.get(flow.get("password_env", ""), ""),
             "client_id": flow.get("client_id", ""),
-            "client_secret": flow.get("client_secret_env") and
-                              os.environ.get(flow["client_secret_env"], "") or "",
+            "client_secret": client_secret,
             "scope": flow.get("scope", ""),
         }
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -600,13 +659,27 @@ async def _t_endpoint_enum(args: dict) -> list[TextContent]:
     else:
         return _err("provide either openapi_url or openapi_path")
 
+    # JSON is a subset of YAML, but YAML's parser will accept JSON that has
+    # tabs in odd places. Try JSON first because it gives sharper errors,
+    # then fall back to YAML if it fails for any reason — *not* by looking
+    # at the first character (the prior heuristic broke on BOMs, leading
+    # whitespace, JSONP-style wrappers, and YAML docs whose first line is a
+    # comment).
+    spec = None
+    json_err: Exception | None = None
     try:
-        if spec_text.strip().startswith("{"):
-            spec = json.loads(spec_text)
-        else:
+        spec = json.loads(spec_text)
+    except json.JSONDecodeError as e:
+        json_err = e
+    if spec is None:
+        try:
             spec = yaml.safe_load(spec_text)
-    except Exception as e:
-        return _err(f"failed to parse openapi: {e}")
+        except yaml.YAMLError as e:
+            return _err(
+                f"failed to parse openapi as JSON ({json_err}) or YAML ({e})"
+            )
+    if not isinstance(spec, dict):
+        return _err("openapi document did not parse to an object")
 
     endpoints: list[dict] = []
     base_url = ""
@@ -652,12 +725,14 @@ async def _t_crawl(args: dict) -> list[TextContent]:
     from urllib.parse import urljoin, urlparse
     seed_host = urlparse(seed_url).hostname
     seen: set[str] = set()
-    queue: list[tuple[str, int]] = [(seed_url, 0)]
+    # ``deque.popleft`` is O(1); list.pop(0) is O(n) and was visibly slow
+    # on crawls with > a few hundred queued links.
+    queue: deque[tuple[str, int]] = deque([(seed_url, 0)])
     results: list[dict] = []
     link_re = re.compile(r'(?:href|src)\s*=\s*[\'"]([^\'"\s>]+)', re.IGNORECASE)
 
     while queue and len(results) < max_pages:
-        url, depth = queue.pop(0)
+        url, depth = queue.popleft()
         if url in seen:
             continue
         seen.add(url)
@@ -805,10 +880,11 @@ def _observe_diff(payload: str, baseline: dict, resp: dict) -> dict:
 
 def _t_oob_register(args: dict) -> list[TextContent]:
     cfg = _dast_config().get("oob", {}) or {}
-    if not cfg.get("collector_url"):
-        return _err("scan.dast.oob.collector_url not configured")
     client = OobClient(cfg)
-    token, callback_url = client.register(label=args.get("label", "lacuna"))
+    try:
+        token, callback_url = client.register(label=args.get("label", "lacuna"))
+    except OobNotConfigured as e:
+        return _err(str(e))
     return _ok({
         "summary": f"OOB token registered: {token}",
         "token": token,
@@ -819,10 +895,11 @@ def _t_oob_register(args: dict) -> list[TextContent]:
 
 async def _t_oob_poll(args: dict) -> list[TextContent]:
     cfg = _dast_config().get("oob", {}) or {}
-    if not cfg.get("collector_url"):
-        return _err("scan.dast.oob.collector_url not configured")
     client = OobClient(cfg)
-    hits = await client.poll(args["token"], args.get("since_seconds", 600))
+    try:
+        hits = await client.poll(args["token"], args.get("since_seconds", 600))
+    except OobNotConfigured as e:
+        return _err(str(e))
     return _ok({
         "summary": f"{len(hits)} OOB hits on token {args['token']}",
         "hits": hits,
@@ -855,7 +932,7 @@ async def _t_header_test(args: dict) -> list[TextContent]:
         })
 
     if kind == "cors":
-        evil_origin = "https://lacuna-evil.example"
+        evil_origin = f"https://{_CANARY_HOST}"
         resp = await _do_request("OPTIONS", url, session=session, headers={
             "Origin": evil_origin,
             "Access-Control-Request-Method": "POST",
@@ -877,36 +954,151 @@ async def _t_header_test(args: dict) -> list[TextContent]:
         })
 
     if kind == "host-injection":
-        from urllib.parse import urlparse
-        host = urlparse(url).hostname or ""
         resp = await _do_request(
             "GET", url, session=session,
-            headers={"Host": "lacuna-evil.example", "X-Forwarded-Host": "lacuna-evil.example"},
+            headers={"Host": _CANARY_HOST, "X-Forwarded-Host": _CANARY_HOST},
         )
-        body = resp.get("body_sample", "") or ""
-        leaked = "lacuna-evil.example" in body
+        # ``body_sample`` is capped at 2KB; for a host-injection leak we
+        # want a real answer. Read the full body from ``body_payload_ref``.
+        full_body = ""
+        ref = resp.get("body_payload_ref")
+        if ref:
+            try:
+                full_body = Path(ref).read_text(errors="replace")
+            except OSError:
+                full_body = resp.get("body_sample", "") or ""
+        else:
+            full_body = resp.get("body_sample", "") or ""
+        leaked = _CANARY_HOST in full_body
         return _ok({
             "summary": f"host-injection: leaked-into-response={leaked}",
             "leaked": leaked, "response": resp,
         })
 
     if kind in {"smuggling-clte", "smuggling-tecl"}:
-        # NOTE: real smuggling tests require raw socket access; httpx normalizes.
-        # We probe via duplicate Content-Length / Transfer-Encoding combos and
-        # surface the response only — agent must reason about smuggling risk.
-        if kind == "smuggling-clte":
-            headers = {"Content-Length": "4", "Transfer-Encoding": "chunked"}
-        else:
-            headers = {"Transfer-Encoding": "chunked", "Content-Length": "4"}
-        resp = await _do_request("POST", url, session=session, headers=headers,
-                                   data="0\r\n\r\nG")
-        return _ok({
-            "summary": f"smuggling probe ({kind}) → {resp.get('status')}",
-            "response": resp,
-            "note": "Real smuggling confirmation requires raw-socket follow-up.",
-        })
+        return await _t_smuggling_probe(url, kind)
 
     return _err(f"unknown header test kind: {kind}")
+
+
+async def _t_smuggling_probe(url: str, kind: str) -> list[TextContent]:
+    """Send a raw request smuggling probe and capture the raw response.
+
+    Smuggling can only be tested with a hand-built byte stream — any HTTP
+    client (httpx included) normalises the Content-Length / Transfer-
+    Encoding pair before sending. We open a TCP/TLS socket directly and
+    send the exact bytes, then read whatever the server returns.
+    """
+    import socket
+    import ssl as ssl_module
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    body = "0\r\n\r\nG"
+    if kind == "smuggling-clte":
+        headers_block = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: Lacuna/{_LACUNA_VERSION}\r\n"
+            f"Content-Length: 4\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+    else:
+        headers_block = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: Lacuna/{_LACUNA_VERSION}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"Content-Length: 4\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+    raw_request = (headers_block + body).encode("ascii")
+
+    raw_response = b""
+    error: str | None = None
+    started = time.time()
+    try:
+        loop = asyncio.get_running_loop()
+
+        def _send_and_recv() -> bytes:
+            with socket.create_connection((host, port), timeout=15) as sock:
+                if parsed.scheme == "https":
+                    ctx = ssl_module.create_default_context()
+                    with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                        ssock.sendall(raw_request)
+                        chunks: list[bytes] = []
+                        while True:
+                            try:
+                                chunk = ssock.recv(8192)
+                            except TimeoutError:
+                                break
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            if sum(len(c) for c in chunks) > 65536:
+                                break
+                        return b"".join(chunks)
+                else:
+                    sock.sendall(raw_request)
+                    chunks = []
+                    while True:
+                        try:
+                            chunk = sock.recv(8192)
+                        except TimeoutError:
+                            break
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if sum(len(c) for c in chunks) > 65536:
+                            break
+                    return b"".join(chunks)
+
+        raw_response = await loop.run_in_executor(None, _send_and_recv)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+
+    duration_ms = int((time.time() - started) * 1000)
+    response_head = raw_response[:2048].decode("latin-1", errors="replace")
+    request_blob = {
+        "method": "POST", "url": url, "raw_request": raw_request.decode(
+            "latin-1", errors="replace",
+        ),
+    }
+    response_blob = {
+        "raw_response_head": response_head,
+        "bytes": len(raw_response),
+        "duration_ms": duration_ms,
+        "error": error,
+    }
+    ev_dir = _materialize_trace("dast-smuggling", request_blob, response_blob)
+
+    response_status = None
+    if raw_response[:5] == b"HTTP/":
+        try:
+            status_line = raw_response.split(b"\r\n", 1)[0].decode("latin-1")
+            response_status = int(status_line.split(" ", 2)[1])
+        except (IndexError, ValueError):
+            pass
+    return _ok({
+        "summary": f"raw smuggling probe ({kind}) → "
+                    f"{response_status if response_status is not None else 'no-response'}",
+        "kind": kind,
+        "status": response_status,
+        "raw_response_head": response_head,
+        "evidence_dir": ev_dir,
+        "error": error,
+        "note": (
+            "Diff CL+TE precedence by comparing status/headers from this "
+            "raw probe to an identical request without the conflicting "
+            "header — the divergence is the smuggling signal."
+        ),
+    })
 
 
 # ─── new in v2: Playwright + deep oracles ─────────────────────────────────
@@ -940,11 +1132,47 @@ def _t_oracle_sqlmap(args: dict) -> list[TextContent]:
     ))
 
 
+_YSOSERIAL_GADGETS = {
+    "java": {
+        "CommonsCollections1", "CommonsCollections2", "CommonsCollections3",
+        "CommonsCollections4", "CommonsCollections5", "CommonsCollections6",
+        "CommonsCollections7",
+        "CommonsBeanutils1", "Spring1", "Spring2",
+        "Groovy1", "Hibernate1", "Hibernate2",
+        "JSON1", "JBossInterceptors1", "JRMPClient", "JRMPListener",
+        "Jdk7u21", "Jython1", "URLDNS",
+        "Vaadin1", "FileUpload1", "ROME",
+    },
+    "dotnet": {
+        "TypeConfuseDelegate", "WindowsIdentity", "TextFormattingRunProperties",
+        "ObjectDataProvider", "PSObject", "DataSet", "ActivitySurrogateSelector",
+        "ResourceSet", "WindowsClaimsIdentity", "WindowsPrincipal",
+    },
+}
+
+
 def _t_oracle_ysoserial(args: dict) -> list[TextContent]:
+    """Generate a deserialization gadget. Preflight-checks the gadget name.
+
+    ysoserial only ships a fixed set of gadgets per runtime; asking for a
+    gadget it doesn't know wastes a subprocess invocation (and a few
+    seconds) producing a confusing stderr. We catch that here.
+    """
+    runtime = args["runtime"]
+    gadget = args["gadget"]
+    valid = _YSOSERIAL_GADGETS.get(runtime, set())
+    if gadget not in valid:
+        suggestions = sorted(
+            g for g in valid if gadget.lower() in g.lower()
+        ) or sorted(valid)[:10]
+        return _err(
+            f"unknown ysoserial gadget for {runtime}: '{gadget}'. "
+            f"Suggested: {suggestions}"
+        )
     from lacuna.oracles import generate_ysoserial_payload
     return _ok(generate_ysoserial_payload(
-        runtime=args["runtime"],
-        gadget=args["gadget"],
+        runtime=runtime,
+        gadget=gadget,
         command=args["command"],
     ))
 
@@ -962,8 +1190,8 @@ def _t_oracle_gopherus(args: dict) -> list[TextContent]:
 def _t_fuzz_function(args: dict) -> list[TextContent]:
     """Fuzz a function, record results to KG."""
     from pathlib import Path
-    import time
-    from lacuna.dynamic.fuzzer import fuzz_function, to_dict
+
+    from lacuna.dynamic.fuzzer import fuzz_function
 
     workspace = Path(os.environ.get(
         "LACUNA_FUZZ_WORKSPACE", "/state/fuzz",
@@ -1056,6 +1284,7 @@ def _t_symex_reach(args: dict) -> list[TextContent]:
 def _t_differential_parse(args: dict) -> list[TextContent]:
     """Multi-parser differential testing."""
     import binascii
+
     from lacuna.dynamic.differential import differential_parse, to_dict
     try:
         input_bytes = binascii.unhexlify(args["input_bytes_hex"])

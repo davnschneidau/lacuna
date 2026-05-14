@@ -36,6 +36,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
 
 # Patterns that indicate a *guard was added* in the after-state.
 GUARD_PATTERNS = {
@@ -97,8 +98,10 @@ GUARD_PATTERNS = {
         re.compile(r"\bformatMsgNoLookups|StringSubstitutor.disable|"
                     r"\.replaceAll\s*\(\s*['\"][$%]"),
     ],
-    "CWE-94":  [  # code injection
-        re.compile(r"\bast\.literal_eval\b|\bjson\.loads\b"),
+    "CWE-94":  [  # code injection: replacing eval()/exec() with
+        # ast.literal_eval is a real guard. ``json.loads`` is NOT — it's
+        # the right call for parsing JSON but doesn't sanitize anything.
+        re.compile(r"\bast\.literal_eval\b"),
     ],
 }
 
@@ -317,68 +320,99 @@ def generate_rule(
     *shape* without over-fitting to specific variable names.
     """
     if not before_snippet:
-        return f"# no before-snippet available for {source_ref}\nrules: []"
+        # ``yaml.safe_dump`` so the empty-rules sentinel is still valid
+        # YAML rather than a stray ``rules: []`` after a comment.
+        return yaml.safe_dump(
+            {"rules": [], "_note": f"no before-snippet available for {source_ref}"},
+            sort_keys=False,
+            default_flow_style=False,
+        )
 
     pattern = _pattern_from_snippet(before_snippet)
     languages = _guess_languages(before_snippet)
-    rule = f"""rules:
-  - id: patch-essence-{_safe_id(source_ref)}
-    message: |
-      Pattern matches the BEFORE-state of a security-relevant fix in
-      {source_ref}. Bug class: {bug_class}.
-    languages: {languages}
-    severity: WARNING
-    pattern: |
-      {pattern}
-    metadata:
-      cwe: "{bug_class}"
-      source_ref: "{source_ref}"
-      auto_generated: true
-"""
-    return rule
+    rule_doc = {
+        "rules": [
+            {
+                "id": f"patch-essence-{_safe_id(source_ref)}",
+                "message": (
+                    "Pattern matches the BEFORE-state of a security-relevant "
+                    f"fix in {source_ref}. Bug class: {bug_class}."
+                ),
+                "languages": languages,
+                "severity": "WARNING",
+                "pattern": pattern,
+                "metadata": {
+                    "cwe": bug_class,
+                    "source_ref": source_ref,
+                    "auto_generated": True,
+                },
+            },
+        ],
+    }
+    # ``default_style="|"`` keeps the multi-line pattern readable in the
+    # generated YAML rather than collapsing it onto one line.
+    return yaml.safe_dump(
+        rule_doc,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+
+
+# Lower-cased once; case-insensitive comparisons happen against this set
+# so we avoid the previous "true/True/false/False/None" duplication.
+_PATTERN_KEYWORDS = frozenset({
+    "if", "else", "while", "for", "return", "def", "class", "func",
+    "function", "var", "let", "const", "new", "in", "is", "not", "and",
+    "or", "true", "false", "null", "none",
+    "void", "int", "char", "size_t", "static", "extern", "public",
+    "private", "protected", "self", "this",
+})
+
+
+def _substitute_idents(line: str) -> str:
+    """Replace identifiers in one line of code with stable metavars.
+
+    Each call gets its own ``seen`` / ``var_idx`` state so identifiers
+    are renumbered fresh per-line — there's no cross-line sharing of
+    metavar identity, which keeps the resulting semgrep rules narrow
+    enough to actually match the original shape.
+    """
+    seen: dict[str, str] = {}
+    var_idx = [0]
+
+    def replace_id(m: re.Match[str]) -> str:
+        ident = m.group(0)
+        if ident.lower() in _PATTERN_KEYWORDS or ident.isdigit():
+            return ident
+        if ident in seen:
+            return seen[ident]
+        var_idx[0] += 1
+        mv = f"$X{var_idx[0]}"
+        seen[ident] = mv
+        return mv
+
+    return re.sub(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", replace_id, line).strip()
 
 
 def _pattern_from_snippet(snippet: str) -> str:
     """Convert a code snippet into a semgrep-style pattern with metavars."""
-    # Strip whitespace-only lines
-    lines = [l for l in snippet.splitlines() if l.strip()]
+    lines = [ln for ln in snippet.splitlines() if ln.strip()]
     if not lines:
         return "..."
 
     pattern_lines: list[str] = []
     for line in lines[:5]:
-        # Replace identifiers (lowercase words ≥2 chars) with semgrep metavars
-        # but preserve language keywords and operators
-        KEYWORDS = {
-            "if", "else", "while", "for", "return", "def", "class", "func",
-            "function", "var", "let", "const", "new", "in", "is", "not", "and",
-            "or", "true", "false", "null", "None", "true", "False",
-            "void", "int", "char", "size_t", "static", "extern", "public",
-            "private", "protected", "self", "this",
-        }
-        var_idx = [0]
-        seen: dict[str, str] = {}
-        def replace_id(m):
-            ident = m.group(0)
-            if ident.lower() in KEYWORDS or ident.isdigit():
-                return ident
-            if ident in seen:
-                return seen[ident]
-            var_idx[0] += 1
-            mv = f"$X{var_idx[0]}"
-            seen[ident] = mv
-            return mv
-        pattern = re.sub(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", replace_id, line)
-        pattern_lines.append(pattern.strip())
+        pattern_lines.append(_substitute_idents(line))
 
-    # Join with ellipsis if multi-line
     if len(pattern_lines) == 1:
         return pattern_lines[0]
-    return "\n      ".join(pattern_lines)
+    return "\n".join(pattern_lines)
 
 
-def _guess_languages(snippet: str) -> str:
-    """Guess languages based on syntactic hints."""
+def _guess_languages(snippet: str) -> list[str]:
+    """Guess languages based on syntactic hints. Returns a list so the
+    YAML dumper emits a proper sequence rather than a literal string."""
     hints = {
         "python": [r"\bdef\s+\w+\(", r"\bself\b", r"\.format\("],
         "javascript": [r"\bfunction\b", r"\bconst\b\s+\w+", r"=>\s*\{"],
@@ -386,11 +420,11 @@ def _guess_languages(snippet: str) -> str:
         "java": [r"\bpublic\s+(class|void|static)", r"\bnew\s+[A-Z]\w+\("],
         "c": [r"\bmalloc\b", r"\bfree\b", r"\bvoid\b\s+\*"],
     }
-    langs = []
+    langs: list[str] = []
     for lang, patterns in hints.items():
         if any(re.search(p, snippet) for p in patterns):
             langs.append(lang)
-    return "[" + ", ".join(langs) + "]" if langs else "[generic]"
+    return langs or ["generic"]
 
 
 def _safe_id(s: str) -> str:

@@ -19,7 +19,8 @@ import sys
 
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
-from lacuna.kg import open_kg  # noqa: E402
+from lacuna.hooks import is_orchestrator
+from lacuna.kg import open_kg
 
 
 def main() -> int:
@@ -33,7 +34,7 @@ def main() -> int:
 
     # Subagents are allowed to stop freely — only the orchestrator is bound by
     # exit criteria.
-    if agent != "orchestrator":
+    if not is_orchestrator(agent):
         print(json.dumps({"decision": "allow"}))
         return 0
 

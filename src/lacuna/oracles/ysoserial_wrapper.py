@@ -19,7 +19,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 YSOSERIAL_JAR_DEFAULT = os.environ.get(
     "YSOSERIAL_JAR", "/opt/ysoserial-all.jar",
 )
@@ -110,10 +109,7 @@ def generate_ysoserial_payload(
         payload_b64 = raw.decode(errors="replace").strip()
     else:
         # Java: raw bytes; base64-encode for transport
-        if output_format == "base64":
-            payload_b64 = base64.b64encode(raw).decode()
-        else:
-            payload_b64 = raw.hex()
+        payload_b64 = base64.b64encode(raw).decode() if output_format == "base64" else raw.hex()
     return {
         "summary": f"generated {runtime} {gadget} payload ({len(payload_b64)} chars b64)",
         "runtime": runtime,

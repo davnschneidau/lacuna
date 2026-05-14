@@ -7,7 +7,7 @@ name = "lacuna"
 version = "3.0.0"
 description = "Agentic, multi-repo, application-level security scanner"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Lacuna contributors" }]
 dependencies = [
@@ -17,7 +17,8 @@ dependencies = [
     "anyio>=4.3.0",
     "mcp>=0.9.0",
     "tree-sitter>=0.21.0",
-    "tree-sitter-languages>=1.10.2",
+    "tree-sitter-language-pack>=0.3.0",
+    "defusedxml>=0.7.1",
     "gitpython>=3.1.43",
     "prance>=23.6.21.0",
     "openapi-spec-validator>=0.7.1",
@@ -66,5 +67,4 @@ select = ["E", "F", "I", "W", "N", "UP", "B", "SIM", "RUF"]
 ignore = ["E501"]  # line length handled by formatter
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 testpaths = ["tests"]

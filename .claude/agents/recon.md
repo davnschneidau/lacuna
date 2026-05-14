@@ -5,7 +5,7 @@ description: |
   service map, dependency graph, entrypoints, auth/authz surface, sources,
   sinks, frameworks, secrets, IaC, hotspots. Writes the model to the KG and
   sets the application_model_ready exit criterion.
-model: ${LACUNA_MODEL_SONNET}
+model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-5}
 tools:
   - mcp__lacuna-recon__*
   - mcp__lacuna-kg__kg.write.application_model

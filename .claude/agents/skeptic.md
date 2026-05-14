@@ -1,18 +1,18 @@
 ---
 name: skeptic
 description: Adversarial reviewer. Reads confirmed findings (post-validator) and attempts to refute them. Catches over-eager validators. Cheap with Haiku.
-model: haiku
-allowed-tools:
-  - kg.read.findings
-  - kg.read.primitives
-  - kg.read.minimal_repro
-  - kg.read.flow_paths
-  - kg.read.reachability
-  - kg.read.fuzz_crashes
-  - kg.read.fuzz_runs
-  - kg.read.variant_links
-  - kg.write.observation
-  - kg.write.coverage_gap
+model: ${LACUNA_MODEL_HAIKU:-claude-haiku-4-5}
+tools:
+  - mcp__lacuna-kg__kg.read.findings
+  - mcp__lacuna-kg__kg.read.primitives
+  - mcp__lacuna-kg__kg.read.minimal_repro
+  - mcp__lacuna-kg__kg.read.flow_paths
+  - mcp__lacuna-kg__kg.read.reachability
+  - mcp__lacuna-kg__kg.read.fuzz_crashes
+  - mcp__lacuna-kg__kg.read.fuzz_runs
+  - mcp__lacuna-kg__kg.read.variant_links
+  - mcp__lacuna-kg__kg.write.observation
+  - mcp__lacuna-kg__kg.write.coverage_gap
   - mcp__lacuna-recon__code_excerpt
   - mcp__lacuna-recon__git_blame_function
   - mcp__lacuna-recon__function_change_history

@@ -26,10 +26,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 
 from .ast_parse import Node, parse_python_file, parse_with_tree_sitter
-
 
 SUFFIX_TO_LANG = {
     ".py": "python",
@@ -62,11 +60,17 @@ class FunctionInfo:
 class CallSite:
     caller_qualname: str
     callee_name: str               # raw text from source — may be qualified
-    callee_resolved: str | None    # full qualname if resolved, else None
+    callee_resolved: str | None    # best-effort single qualname; first
+                                    # candidate when multiple match
     file: str
     line: int
     args_repr: list[str] = field(default_factory=list)
     kwargs_repr: dict[str, str] = field(default_factory=dict)
+    # When the call could resolve to multiple methods (e.g. ``obj.execute``
+    # with several classes defining ``execute``), the taint engine fans out
+    # at low confidence using this list.
+    callee_candidates: list[str] = field(default_factory=list)
+    ambiguous_resolution: bool = False
 
 
 class CallGraph:
@@ -94,30 +98,33 @@ class CallGraph:
                 continue
             files_seen += 1
             try:
-                if lang == "python":
-                    root = parse_python_file(p)
-                else:
-                    root = parse_with_tree_sitter(p, lang)
+                root = parse_python_file(p) if lang == "python" else parse_with_tree_sitter(p, lang)
             except Exception:
                 continue
             if root is None:
                 continue
             self._index_module(root, p, lang)
 
-        # Phase 2: resolve calls now that all functions are known
+        # Phase 2: resolve calls now that all functions are known.
         for caller, calls in list(self.calls_by_function.items()):
             for cs in calls:
-                cs.callee_resolved = self._resolve_callee(
+                candidates = self._resolve_callee_candidates(
                     cs.callee_name, cs.file,
                 )
-                if cs.callee_resolved:
-                    self.callers_of.setdefault(
-                        cs.callee_resolved, set(),
-                    ).add(caller)
+                cs.callee_candidates = candidates
+                cs.ambiguous_resolution = len(candidates) > 1
+                cs.callee_resolved = candidates[0] if candidates else None
+                for cand in candidates:
+                    self.callers_of.setdefault(cand, set()).add(caller)
 
     def _index_module(self, root: Node, path: Path, lang: str) -> None:
-        rel_path = str(path.relative_to(self.repo_root))
-        module_name = rel_path.removesuffix(path.suffix).replace("/", ".")
+        # Build the dotted module name from pathlib parts so the result is
+        # identical on Windows (backslashes) and POSIX (forward slashes). The
+        # earlier ``rel_path.replace("/", ".")`` only handled POSIX and left
+        # backslashes embedded in qualified names on Windows, which broke
+        # cross-file callee resolution.
+        rel = path.relative_to(self.repo_root).with_suffix("")
+        module_name = ".".join(rel.parts)
 
         # First pass — imports (file-local symbol table)
         imp_map: dict[str, str] = {}
@@ -201,47 +208,69 @@ class CallGraph:
 
     # ── Resolution ─────────────────────────────────────────────────────────
 
-    def _resolve_callee(self, raw_name: str, file: str) -> str | None:
-        """Resolve a call-expression text to a qualname in self.functions."""
+    def _resolve_callee_candidates(
+        self, raw_name: str, file: str,
+    ) -> list[str]:
+        """Return *all* qualnames that the call text could refer to.
+
+        Earlier revisions only returned the resolution when it was unique,
+        which made method-call analysis silently disappear in codebases
+        where the same name appears on multiple classes. We now surface
+        every candidate; consumers decide whether to fan out (taint engine
+        does, at reduced confidence) or pick the first (reachability BFS).
+        """
         if not raw_name:
-            return None
-        # Direct match first
-        if raw_name in self.functions:
-            return raw_name
+            return []
         # Strip trailing `(...)` if tree-sitter included it
         if raw_name.endswith("()") or raw_name.endswith("(...)"):
             raw_name = raw_name.rsplit("(", 1)[0]
+        # Strip ``new `` prefix (Java/C++/JS new-expression rendering)
+        if raw_name.startswith("new "):
+            raw_name = raw_name[4:].rstrip()
 
-        # Bare name — look up imports for this file
+        # Direct qualname match
+        if raw_name in self.functions:
+            return [raw_name]
+
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _push(q: str) -> None:
+            if q in seen:
+                return
+            seen.add(q)
+            out.append(q)
+
         imp_map = self.imports_by_file.get(file, {}) or {}
+
+        # Bare name + import alias → imported qualname
         if "." not in raw_name and raw_name in imp_map:
             full = imp_map[raw_name]
             if full in self.functions:
-                return full
-            # Try suffix match
+                _push(full)
             for q in self.functions:
                 if q.endswith("." + full) or q.endswith("." + raw_name):
-                    return q
+                    _push(q)
 
-        # Attribute call — pattern `obj.method` → try Class.method match
+        # Attribute call ``obj.method`` → every Class.method match
         if "." in raw_name:
-            parts = raw_name.rsplit(".", 1)
-            method = parts[-1]
-            # Find any class method with this name
-            method_matches = [
-                q for q, fi in self.functions.items()
-                if fi.name == method and fi.class_name
-            ]
-            if len(method_matches) == 1:
-                return method_matches[0]
+            method = raw_name.rsplit(".", 1)[-1]
+            for q, fi in self.functions.items():
+                if fi.name == method and fi.class_name:
+                    _push(q)
 
-        # Bare name match — only return if unique
-        name_matches = [
-            q for q, fi in self.functions.items() if fi.name == raw_name
-        ]
-        if len(name_matches) == 1:
-            return name_matches[0]
-        return None
+        # Bare name match — every function with that name
+        if not out:
+            for q, fi in self.functions.items():
+                if fi.name == raw_name:
+                    _push(q)
+
+        return out
+
+    def _resolve_callee(self, raw_name: str, file: str) -> str | None:
+        """Legacy single-result resolver. Returns the first candidate."""
+        cands = self._resolve_callee_candidates(raw_name, file)
+        return cands[0] if cands else None
 
     # ── Reachability ──────────────────────────────────────────────────────
 
@@ -267,10 +296,10 @@ class CallGraph:
                 if not callee:
                     continue
                 if callee == target:
-                    return True, path + [callee]
+                    return True, [*path, callee]
                 if callee not in visited:
                     visited.add(callee)
-                    queue.append((callee, path + [callee]))
+                    queue.append((callee, [*path, callee]))
         return False, []
 
     def callers(self, qualname: str, transitive: bool = False) -> set[str]:

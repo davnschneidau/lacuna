@@ -30,7 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from lacuna.flow.ast_parse import (
-    Node, parse_python_file, parse_with_tree_sitter,
+    Node,
+    parse_python_file,
+    parse_with_tree_sitter,
 )
 
 SKIP = re.compile(
@@ -99,12 +101,11 @@ def analyze(repo_root: Path, repo_name: str | None = None,
     log4j_vulnerable = False
     if dependency_hint:
         for dep, ver in dependency_hint.items():
-            if "log4j" in dep.lower():
-                # Conservative: any log4j 2.x not >=2.17 is flagged
-                if re.match(r"2\.(\d+)", ver):
-                    minor = int(re.match(r"2\.(\d+)", ver).group(1))
-                    if minor < 17:
-                        log4j_vulnerable = True
+            if "log4j" not in dep.lower():
+                continue
+            m = re.match(r"2\.(\d+)", ver)
+            if m and int(m.group(1)) < 17:
+                log4j_vulnerable = True
 
     for p in repo_root.rglob("*"):
         if files_scanned >= max_files:
@@ -117,10 +118,7 @@ def analyze(repo_root: Path, repo_name: str | None = None,
         if languages and lang not in languages:
             continue
         try:
-            if lang == "python":
-                root = parse_python_file(p)
-            else:
-                root = parse_with_tree_sitter(p, lang)
+            root = parse_python_file(p) if lang == "python" else parse_with_tree_sitter(p, lang)
         except Exception:
             continue
         if root is None:

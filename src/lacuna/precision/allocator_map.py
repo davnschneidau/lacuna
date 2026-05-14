@@ -25,7 +25,6 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-
 SKIP = re.compile(
     r"/(\.git|node_modules|\.venv|venv|__pycache__|dist|build|target|"
     r"vendor)/"
@@ -63,7 +62,7 @@ def analyze(repo_root: Path, repo_name: str | None = None,
             max_files: int = 5000) -> dict:
     repo_name = repo_name or repo_root.name
     global_allocators: Counter = Counter()
-    per_function: dict[str, dict] = defaultdict(lambda: defaultdict(int))
+    defaultdict(lambda: defaultdict(int))
     custom_alloc_calls: Counter = Counter()
     custom_free_calls: Counter = Counter()
     gfp_flags_seen: Counter = Counter()

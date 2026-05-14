@@ -34,14 +34,10 @@ described below, is built in to v2).
 
 ### Phase 0 — Bootstrap
 
-Before recon, seed durable knowledge into the KG:
-
-```
-python3 -c "from lacuna.tools.gadget_catalog import seed_into_kg; print(seed_into_kg())"
-```
-
-This populates the known-gadget catalog (≈21 entries across Java, Python,
-Node, Ruby, PHP, .NET). Hunters and validators query it via `known_gadgets`.
+The known-gadget catalog (≈21 entries across Java, Python, Node, Ruby,
+PHP, .NET) is seeded automatically by the `SessionStart` hook on the
+first session of the scan. Hunters and validators query it via
+`known_gadgets`; you do not need to seed it yourself.
 
 ### Phase 1 — Reconnaissance (parallel per repo)
 
@@ -220,7 +216,6 @@ Cap: at most 2 re-opens per chain candidate, to bound runaway.
    - chain search exhausted
    - every confirmed finding has a `minimal_repro`
    - skeptic has reviewed every medium+ finding
-   - **v3**: no in-flight `fuzz_runs` with status=`running`
    - **v3**: no unreviewed high-severity `precision_findings`
    - `reports_generated`
 

@@ -25,7 +25,6 @@ Outputs go to {WORKSPACE}/fuzz/{repo}-{function_safe_name}/ with:
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
@@ -35,26 +34,70 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
+# Two flavors per template — one for C (extern "C" wrapper around plain
+# function declarations), one for C++ (no extern "C" because the target
+# function may be mangled). The fuzzer probes the symbol table of the
+# library to decide which one to use.
 HARNESS_TEMPLATES = {
-    "bytes_size": '''
+    "bytes_size_c": '''
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {{
+#endif
 extern {return_type} {function_name}({param_decls});
+#ifdef __cplusplus
+}}
+#endif
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {{
     {call_expr};
     return 0;
 }}
 ''',
-    "cstr": '''
+    "cstr_c": '''
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef __cplusplus
+extern "C" {{
+#endif
 extern {return_type} {function_name}({param_decls});
+#ifdef __cplusplus
+}}
+#endif
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {{
+    char *buf = (char *)malloc(Size + 1);
+    if (!buf) return 0;
+    memcpy(buf, Data, Size);
+    buf[Size] = 0;
+    {call_expr};
+    free(buf);
+    return 0;
+}}
+''',
+    "bytes_size_cpp": '''
+#include <stdint.h>
+#include <stddef.h>
+
+{return_type} {function_name}({param_decls});
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {{
+    {call_expr};
+    return 0;
+}}
+''',
+    "cstr_cpp": '''
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+
+{return_type} {function_name}({param_decls});
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {{
     char *buf = (char *)malloc(Size + 1);
@@ -67,6 +110,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {{
 }}
 ''',
 }
+
+
+def _detect_target_language(library_path: str | Path, function_name: str) -> str:
+    """Return ``"c"`` or ``"cpp"`` by looking at the library's exports.
+
+    Uses ``nm`` if available, otherwise falls back to ``c``. C functions
+    appear as unmangled symbols (``foo``); C++ functions appear as
+    mangled ones (``_Z3fooi``). If the symbol can be found unmangled,
+    treat the target as C; otherwise C++.
+    """
+    try:
+        proc = subprocess.run(
+            ["nm", "-g", "--defined-only", str(library_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "c"
+    if proc.returncode != 0:
+        return "c"
+    symbols = proc.stdout
+    # ``T``/``D``/``B`` are defined symbol classes. Look for the bare
+    # ``function_name`` first.
+    if re.search(rf"\b[TDBR]\s+{re.escape(function_name)}\b", symbols):
+        return "c"
+    if re.search(rf"\b[TDBR]\s+_Z\w*{re.escape(function_name)}\w*\b", symbols):
+        return "cpp"
+    # Fall back to C — the linker will tell us if we're wrong.
+    return "c"
 
 
 @dataclass
@@ -92,22 +163,22 @@ def _safe_name(s: str) -> str:
 def _classify_signature(signature: str) -> tuple[str, str, str]:
     """Classify a C/C++ function signature for harness selection.
 
-    Returns (template_key, return_type, call_expr).
+    Returns (shape, return_type, call_expr). ``shape`` is one of
+    ``"bytes_size"`` or ``"cstr"``; the C-vs-C++ template suffix is
+    chosen later in :func:`generate_harness` based on the actual
+    library.
     """
     sig = signature.strip()
-    # Strip outer parens
     m = re.match(
         r"^\s*(?P<ret>[\w\s\*]+?)\s+(?P<name>\w+)\s*\((?P<args>[^)]*)\)\s*$",
         sig,
     )
     if not m:
-        # Fallback: assume bytes/size
         return "bytes_size", "void", f"({signature})(Data, Size)"
     ret = m.group("ret").strip()
     name = m.group("name")
     args = [a.strip() for a in m.group("args").split(",") if a.strip()]
 
-    # Detect known shapes
     if len(args) == 2 and \
             any(x in args[0] for x in ("uint8_t *", "char *", "u_char *",
                                           "const void *")) and \
@@ -120,20 +191,29 @@ def _classify_signature(signature: str) -> tuple[str, str, str]:
     if len(args) == 1 and "uint8_t" in args[0]:
         return "bytes_size", ret, f"{name}((const uint8_t *)Data)"
 
-    # Last-resort fallback
     return "bytes_size", ret, f"{name}((const uint8_t *)Data, Size)"
 
 
 def generate_harness(
     function_name: str, signature: str, target_dir: Path,
-) -> Path:
-    """Write a libFuzzer harness file. Returns its path."""
-    template_key, return_type, call_expr = _classify_signature(signature)
-    # Re-derive param_decls
+    library_path: str | Path | None = None,
+) -> tuple[Path, str]:
+    """Write a libFuzzer harness file. Returns (harness_path, language).
+
+    ``language`` is ``"c"`` or ``"cpp"`` — the caller uses it to choose
+    between ``clang`` and ``clang++`` when compiling.
+    """
+    shape, return_type, call_expr = _classify_signature(signature)
     m = re.match(
         r"^\s*[\w\s\*]+?\s+\w+\s*\((?P<args>[^)]*)\)\s*$", signature.strip(),
     )
     param_decls = m.group("args") if m else "const uint8_t *Data, size_t Size"
+
+    if library_path is not None:
+        language = _detect_target_language(library_path, function_name)
+    else:
+        language = "c"
+    template_key = f"{shape}_{language}"
 
     harness = HARNESS_TEMPLATES[template_key].format(
         function_name=function_name,
@@ -144,7 +224,7 @@ def generate_harness(
     target_dir.mkdir(parents=True, exist_ok=True)
     harness_path = target_dir / "harness.cc"
     harness_path.write_text(harness)
-    return harness_path
+    return harness_path, language
 
 
 def _build_target(
@@ -205,9 +285,14 @@ def fuzz_function(
     target_dir = workspace / f"{_safe_name(repo)}-{_safe_name(function_name)}"
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    harness_path = generate_harness(function_name, signature, target_dir)
+    harness_path, language = generate_harness(
+        function_name, signature, target_dir, library_path=library_path,
+    )
+    compiler = "clang++" if language == "cpp" else "clang"
     target_bin = target_dir / "fuzz_target"
-    ok, build_log = _build_target(harness_path, library_path, target_bin)
+    ok, build_log = _build_target(
+        harness_path, library_path, target_bin, cxx_compiler=compiler,
+    )
 
     result = FuzzResult(
         repo=repo, function=function_name,
@@ -243,6 +328,8 @@ def fuzz_function(
     )
 
     start = time.time()
+    proc: subprocess.CompletedProcess | None
+    timed_out = False
     try:
         proc = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
@@ -250,8 +337,14 @@ def fuzz_function(
         )
         log = proc.stdout + proc.stderr
     except subprocess.TimeoutExpired as e:
-        log = (e.stdout or "") + (e.stderr or "")
-        proc = None  # type: ignore
+        out_b = e.stdout
+        err_b = e.stderr
+        log = (
+            (out_b.decode("utf-8", "replace") if isinstance(out_b, bytes) else (out_b or ""))
+            + (err_b.decode("utf-8", "replace") if isinstance(err_b, bytes) else (err_b or ""))
+        )
+        proc = None
+        timed_out = True
 
     result.duration_s = int(time.time() - start)
 
@@ -286,11 +379,24 @@ def fuzz_function(
             "asan_log_path": str(asan_log_path),
         })
 
-    result.status = (
-        "crashed" if result.crashes
-        else "completed" if proc and proc.returncode == 0
-        else "timeout"
-    )
+    # Status logic:
+    #   crashed   = libFuzzer found a reproducible crash
+    #   timeout   = we killed the run with SIGTERM (subprocess timeout)
+    #   completed = libFuzzer hit -max_total_time / -runs and exited 0
+    #   failed    = libFuzzer returned a non-zero exit code without a crash
+    if result.crashes:
+        result.status = "crashed"
+    elif timed_out:
+        result.status = "timeout"
+    elif proc is not None and proc.returncode == 0:
+        result.status = "completed"
+    else:
+        result.status = "failed"
+        rc = proc.returncode if proc is not None else -1
+        result.error_message = (
+            f"libFuzzer exited rc={rc} without producing a crash. "
+            f"Inspect fuzz.log for diagnostics."
+        )
     (target_dir / "fuzz.log").write_text(log[-200000:])
     return result
 
@@ -303,7 +409,13 @@ def _replay_crash(target: Path, input_path: Path) -> str:
         )
         return p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
-        return (e.stdout or "") + (e.stderr or "")
+        out = e.stdout or ""
+        err = e.stderr or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        return out + err
     except Exception as e:
         return f"replay failed: {e}"
 

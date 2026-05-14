@@ -13,16 +13,13 @@ is expensive (1-30 min); results are memoized in the KG.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 @dataclass
@@ -129,36 +126,79 @@ def build(
     work.mkdir(parents=True, exist_ok=True)
     log_path = work / "build.log"
 
+    # Cap parallel jobs. ``make -j`` (no number) was the previous default,
+    # which spawns one process per source file — instant OOM on anything
+    # non-trivial. Use ``nproc`` (or 4) as a sensible upper bound.
+    parallel = max(1, min(os.cpu_count() or 4, 8))
+
     # Per-system command sequence
     if bs == "cmake":
         cmds = [
-            f"cmake -B {shlex.quote(str(work))} -S {shlex.quote(str(repo_root))} "
-            f"-DCMAKE_BUILD_TYPE=Debug "
-            f"-DCMAKE_C_FLAGS={shlex.quote(env['CFLAGS'])} "
-            f"-DCMAKE_CXX_FLAGS={shlex.quote(env['CXXFLAGS'])}",
-            f"cmake --build {shlex.quote(str(work))} -j",
+            (
+                f"cmake -B {shlex.quote(str(work))} "
+                f"-S {shlex.quote(str(repo_root))} "
+                f"-DCMAKE_BUILD_TYPE=Debug "
+                # Use CMAKE_*_FLAGS_INIT so the user's CMakeLists.txt is
+                # still allowed to *append* its own warning/flag set on
+                # top. The pre-CMake-3.7 ``CMAKE_C_FLAGS`` form silently
+                # replaced the upstream defaults and produced unbuildable
+                # configurations for many projects.
+                f"-DCMAKE_C_FLAGS_INIT={shlex.quote(env['CFLAGS'])} "
+                f"-DCMAKE_CXX_FLAGS_INIT={shlex.quote(env['CXXFLAGS'])} "
+                f"-DCMAKE_EXE_LINKER_FLAGS_INIT={shlex.quote(env['LDFLAGS'])} "
+                f"-DCMAKE_SHARED_LINKER_FLAGS_INIT={shlex.quote(env['LDFLAGS'])}"
+            ),
+            f"cmake --build {shlex.quote(str(work))} -j{parallel}",
         ]
     elif bs == "autotools":
+        # autotools projects are notorious for refusing in-tree builds.
+        # Configure from inside ``work`` and pass the source tree as a
+        # relative path so the generated Makefiles use the out-of-tree
+        # layout cleanly.
+        rel_src = os.path.relpath(repo_root, work)
         cmds = [
-            (f"cd {shlex.quote(str(repo_root))} && "
-             f"./configure CC=clang CXX=clang++ "
-             f"CFLAGS={shlex.quote(env['CFLAGS'])} "
-             f"CXXFLAGS={shlex.quote(env['CXXFLAGS'])}"),
-            f"make -C {shlex.quote(str(repo_root))} -j",
+            (
+                f"cd {shlex.quote(str(work))} && "
+                f"{shlex.quote(rel_src)}/configure "
+                f"CC=clang CXX=clang++ "
+                f"CFLAGS={shlex.quote(env['CFLAGS'])} "
+                f"CXXFLAGS={shlex.quote(env['CXXFLAGS'])} "
+                f"LDFLAGS={shlex.quote(env['LDFLAGS'])}"
+            ),
+            f"make -C {shlex.quote(str(work))} -j{parallel}",
         ]
     elif bs == "make":
-        cmds = [f"make -C {shlex.quote(str(repo_root))} -j"]
+        cmds = [f"make -C {shlex.quote(str(repo_root))} -j{parallel}"]
     elif bs == "meson":
         cmds = [
             f"meson setup {shlex.quote(str(work))} {shlex.quote(str(repo_root))}",
-            f"meson compile -C {shlex.quote(str(work))}",
+            f"meson compile -C {shlex.quote(str(work))} -j {parallel}",
         ]
     elif bs == "cargo":
-        # Cargo with sanitizers — requires nightly
+        # Cargo with sanitizers requires the nightly toolchain. Preflight
+        # check that ``cargo +nightly`` is actually installed — otherwise
+        # we waste 30s of compile time before discovering it's missing.
+        nightly_check = subprocess.run(
+            ["cargo", "+nightly", "--version"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if nightly_check.returncode != 0:
+            return BuildResult(
+                repo_root=str(repo_root), sanitizers=sanitizers,
+                build_system=bs, status="skipped",
+                command="cargo +nightly --version",
+                duration_s=int(time.time() - start),
+                error_message=(
+                    "cargo nightly toolchain not installed (sanitizers "
+                    "require nightly). Install with: rustup toolchain "
+                    "install nightly"
+                ),
+            )
         cmds = [
             (f"cd {shlex.quote(str(repo_root))} && "
              f"RUSTFLAGS='-Z sanitizer=address' "
-             f"cargo +nightly build --target x86_64-unknown-linux-gnu")
+             f"cargo +nightly build "
+             f"--target x86_64-unknown-linux-gnu --jobs {parallel}")
         ]
     else:
         return BuildResult(
@@ -178,7 +218,10 @@ def build(
                 env=env, timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as e:
-            full_log += f"\n=== TIMEOUT on: {cmd} ===\n{(e.stdout or '')}\n"
+            partial = e.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", "replace")
+            full_log += f"\n=== TIMEOUT on: {cmd} ===\n{partial}\n"
             log_path.write_text(full_log)
             return BuildResult(
                 repo_root=str(repo_root), sanitizers=sanitizers,

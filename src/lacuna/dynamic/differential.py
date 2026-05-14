@@ -22,10 +22,11 @@ to the real binaries (nginx -t, etc.) but they're optional dependencies.
 from __future__ import annotations
 
 import binascii
+import contextlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 
 @dataclass
@@ -51,7 +52,7 @@ class DifferentialResult:
 def _parse_http_strict_first_clen(data: bytes) -> ParserResult:
     """Reject duplicate Content-Length (strict RFC 9110 §8.6)."""
     try:
-        head, _, body = data.partition(b"\r\n\r\n")
+        head, _, _body = data.partition(b"\r\n\r\n")
         lines = head.split(b"\r\n")
         rline = lines[0].decode("latin-1", errors="replace")
         m = re.match(r"^(\w+)\s+(\S+)\s+(\S+)$", rline)
@@ -85,7 +86,7 @@ def _parse_http_strict_first_clen(data: bytes) -> ParserResult:
 def _parse_http_last_clen(data: bytes) -> ParserResult:
     """Tolerant: take the LAST Content-Length on duplicates."""
     try:
-        head, _, body = data.partition(b"\r\n\r\n")
+        head, _, _body = data.partition(b"\r\n\r\n")
         lines = head.split(b"\r\n")
         rline = lines[0].decode("latin-1", errors="replace")
         m = re.match(r"^(\w+)\s+(\S+)\s+(\S+)$", rline)
@@ -98,10 +99,8 @@ def _parse_http_last_clen(data: bytes) -> ParserResult:
                 continue
             k, v = h.split(b":", 1)
             if k.strip().lower() == b"content-length":
-                try:
+                with contextlib.suppress(ValueError):
                     clen = int(v.strip())
-                except ValueError:
-                    pass
         return ParserResult("last_clen", True, parsed={
             "method": method, "path": path, "version": ver,
             "body_len": clen,
@@ -114,7 +113,7 @@ def _parse_http_first_clen_tolerant(data: bytes) -> ParserResult:
     """Tolerant: take the FIRST Content-Length on duplicates.
     (nginx default before late-2022)."""
     try:
-        head, _, body = data.partition(b"\r\n\r\n")
+        head, _, _body = data.partition(b"\r\n\r\n")
         lines = head.split(b"\r\n")
         rline = lines[0].decode("latin-1", errors="replace")
         m = re.match(r"^(\w+)\s+(\S+)\s+(\S+)$", rline)
@@ -144,7 +143,7 @@ def _parse_http_first_clen_tolerant(data: bytes) -> ParserResult:
 def _parse_http_te_chunked_priority(data: bytes) -> ParserResult:
     """Tolerant: when TE: chunked present, ignore Content-Length entirely."""
     try:
-        head, _, body = data.partition(b"\r\n\r\n")
+        head, _, _body = data.partition(b"\r\n\r\n")
         lines = head.split(b"\r\n")
         rline = lines[0].decode("latin-1", errors="replace")
         m = re.match(r"^(\w+)\s+(\S+)\s+(\S+)$", rline)
@@ -161,10 +160,8 @@ def _parse_http_te_chunked_priority(data: bytes) -> ParserResult:
             if kl == b"transfer-encoding" and b"chunked" in v.strip().lower():
                 te_chunked = True
             if kl == b"content-length" and not te_chunked:
-                try:
+                with contextlib.suppress(ValueError):
                     clen = int(v.strip())
-                except ValueError:
-                    pass
         return ParserResult("te_chunked", True, parsed={
             "method": method, "path": path, "version": ver,
             "te_chunked": te_chunked,
@@ -196,16 +193,88 @@ def _parse_url_urllib(data: bytes) -> ParserResult:
         return ParserResult("urllib", False, error=str(e))
 
 
+_WHATWG_SPECIAL_SCHEMES = frozenset(
+    {"http", "https", "ftp", "ws", "wss", "file"},
+)
+_WHATWG_DEFAULT_PORTS = {
+    "http": 80, "https": 443, "ftp": 21, "ws": 80, "wss": 443,
+}
+# Per the WHATWG URL spec, these C0 controls and ASCII tab/LF/CR are stripped
+# anywhere they appear in the input before parsing.
+_WHATWG_STRIPPED = re.compile(r"[\t\n\r]")
+
+
+def _whatwg_normalize_path(path: str) -> str:
+    """Apply WHATWG path normalization: collapse `.`/`..` segments."""
+    if not path.startswith("/"):
+        return path
+    segments: list[str] = []
+    for seg in path.split("/")[1:]:
+        if seg in ("", "."):
+            if path.endswith("/") and seg == "":
+                continue
+            continue
+        if seg == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(seg)
+    normalized = "/" + "/".join(segments)
+    if path.endswith("/") and not normalized.endswith("/"):
+        normalized += "/"
+    return normalized
+
+
 def _parse_url_whatwg(data: bytes) -> ParserResult:
-    r"""Approximate WHATWG URL — handles `\` differently than urllib."""
+    r"""Approximate the WHATWG URL Standard parser.
+
+    This is not bit-perfect (a real implementation would be hundreds of
+    lines), but it reproduces the divergences from RFC 3986 (urllib)
+    that matter for SSRF / parser-confusion exploit classes:
+
+    * leading/trailing whitespace stripped
+    * ASCII tab/LF/CR removed throughout
+    * backslashes become forward slashes for *special* schemes
+    * scheme casing normalized to lower-case
+    * host casing normalized to lower-case (IDNA omitted)
+    * default ports for the scheme are dropped from ``netloc``
+    * path is normalized (``.`` removed, ``..`` pops a segment)
+    * empty path on a special scheme becomes ``/``
+    """
     try:
-        url = data.decode("latin-1")
-        url = url.replace("\\", "/")  # WHATWG canonicalizes backslashes
+        raw = data.decode("latin-1").strip()
+        raw = _WHATWG_STRIPPED.sub("", raw)
+        # Pull the scheme off ourselves so we can decide whether to
+        # canonicalize backslashes.
+        m = re.match(r"^([a-zA-Z][a-zA-Z0-9+\-.]*):", raw)
+        scheme = m.group(1).lower() if m else ""
+        rest = raw[len(m.group(0)):] if m else raw
+        special = scheme in _WHATWG_SPECIAL_SCHEMES
+        if special:
+            rest = rest.replace("\\", "/")
+        normalized = f"{scheme}:{rest}" if scheme else rest
         from urllib.parse import urlparse
-        u = urlparse(url)
+        u = urlparse(normalized)
+        host = (u.hostname or "").lower()
+        port = u.port
+        if port is not None and _WHATWG_DEFAULT_PORTS.get(scheme) == port:
+            port = None
+        userinfo = ""
+        if u.username:
+            userinfo = u.username
+            if u.password:
+                userinfo += f":{u.password}"
+            userinfo += "@"
+        netloc = userinfo + host
+        if port is not None:
+            netloc += f":{port}"
+        path = u.path or ("/" if special and (u.netloc or host) else "")
+        path = _whatwg_normalize_path(path) if special else path
         return ParserResult("whatwg", True, parsed={
-            "scheme": u.scheme, "netloc": u.netloc,
-            "path": u.path, "query": u.query,
+            "scheme": scheme,
+            "netloc": netloc,
+            "path": path,
+            "query": u.query,
         })
     except Exception as e:
         return ParserResult("whatwg", False, error=str(e))
@@ -315,7 +384,7 @@ def differential_parse(
     # Which fields are "decisive" for divergence per protocol. Other
     # fields (headers dict, te_chunked metadata) are informational —
     # different parsers expose them in slightly different ways.
-    DECISIVE_FIELDS: dict[str, tuple[str, ...]] = {
+    DECISIVE_FIELDS: dict[str, tuple[str, ...]] = {  # noqa: N806 — constant table
         "http_request": ("method", "path", "body_len"),
         "url": ("scheme", "netloc", "path", "query"),
         "json": (),  # JSON divergence checks the whole value space below

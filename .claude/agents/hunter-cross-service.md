@@ -2,7 +2,7 @@
 name: hunter-cross-service
 description: |
   Form hypotheses about inter-service vulnerabilities — the bugs that only exist because of the topology, not in any single repo.
-model: ${LACUNA_MODEL_OPUS}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

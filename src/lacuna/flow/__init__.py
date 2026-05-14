@@ -48,10 +48,17 @@ def taint_paths_for(
 
 
 __all__ = [
+    "CallGraph",
+    "CallSite",
+    "FunctionInfo",
     "Node",
-    "CallGraph", "CallSite", "FunctionInfo",
-    "TaintAnalyzer", "TaintHit",
-    "build_call_graph", "reachable", "callers",
-    "taint_paths", "taint_paths_for",
-    "parse_python_file", "parse_with_tree_sitter",
+    "TaintAnalyzer",
+    "TaintHit",
+    "build_call_graph",
+    "callers",
+    "parse_python_file",
+    "parse_with_tree_sitter",
+    "reachable",
+    "taint_paths",
+    "taint_paths_for",
 ]

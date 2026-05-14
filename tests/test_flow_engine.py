@@ -8,8 +8,14 @@ from pathlib import Path
 
 import pytest
 
+# The taint engine parses Python out of the stdlib ``ast`` module, so the
+# baseline tests don't need any third-party language parser. For the
+# non-Python tests we'd guard with ``pytest.importorskip``.
 from lacuna.flow import (
-    build_call_graph, callers, reachable, taint_paths,
+    build_call_graph,
+    callers,
+    reachable,
+    taint_paths,
 )
 
 
@@ -116,23 +122,58 @@ def test_taint_engine_finds_direct_command_injection(flask_app):
     assert "run_cmd" in cmd_hits[0].function
 
 
-def test_taint_engine_respects_sanitizers(flask_app):
-    """app.safe_endpoint uses html.escape and should NOT produce a hit."""
-    cg = build_call_graph(flask_app)
+def test_taint_engine_respects_sanitizers(tmp_path):
+    """A real sanitizer on the safe path must suppress an otherwise identical
+    sink. We give the safe endpoint the *same* sink (cursor.execute on an
+    f-string) as the vulnerable one — the only difference is that the safe
+    path passes the param through ``html.escape``. If the sanitizer logic
+    is correct, the vulnerable endpoint produces a hit and the safe one
+    does not."""
+    (tmp_path / "app.py").write_text(textwrap.dedent("""
+        from flask import Flask, request
+        import sqlite3, html
+
+        app = Flask(__name__)
+        conn = sqlite3.connect("app.db")
+
+        @app.route("/vuln")
+        def vuln():
+            q = request.args.get("q")
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT * FROM items WHERE name = '{q}'")
+            return "ok"
+
+        @app.route("/safe")
+        def safe_endpoint():
+            q = request.args.get("q")
+            nq = html.escape(q)
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT * FROM items WHERE name = '{nq}'")
+            return "ok"
+    """).strip())
+    cg = build_call_graph(tmp_path)
     hits = taint_paths(cg)
-    sanitized_hits = [h for h in hits if "safe_endpoint" in h.function]
-    # If the f-string return path were a sink we'd see template_render here.
-    # The point is: even if a hit appears, the sanitizer should suppress it.
-    # Currently the f-string return isn't a sink (it's just a string literal),
-    # so there should be zero hits in safe_endpoint.
-    assert len(sanitized_hits) == 0
+    sql_hits = [h for h in hits if h.sink_kind == "sql_exec"]
+    vuln_hits = [h for h in sql_hits if "vuln" in h.function]
+    safe_hits = [h for h in sql_hits if "safe_endpoint" in h.function]
+    assert len(vuln_hits) >= 1, "vuln endpoint should produce at least one SQLi hit"
+    assert len(safe_hits) == 0, (
+        "html.escape on the safe path should suppress the SQLi hit; "
+        f"got {len(safe_hits)} hits"
+    )
 
 
 def test_taint_engine_inter_procedural_recursion_limit(tmp_path):
-    """Construct a chain longer than max_depth and confirm it stops."""
+    """Construct a chain longer than max_depth and confirm it stops.
+
+    The chain ends at a real ``cursor.execute(f"...{x}...")`` sink so the
+    test actually exercises depth-limited propagation rather than just
+    proving the engine doesn't crash."""
     (tmp_path / "deep.py").write_text(textwrap.dedent("""
         from flask import Flask, request
+        import sqlite3
         app = Flask(__name__)
+        conn = sqlite3.connect("d.db")
 
         def a(x): return b(x)
         def b(x): return c(x)
@@ -141,7 +182,10 @@ def test_taint_engine_inter_procedural_recursion_limit(tmp_path):
         def e(x): return f(x)
         def f(x): return g(x)
         def g(x): return h(x)
-        def h(x): return x
+        def h(x):
+            cur = conn.cursor()
+            cur.execute(f"SELECT * FROM t WHERE n = '{x}'")
+            return x
 
         @app.route("/x")
         def handler():
@@ -149,28 +193,52 @@ def test_taint_engine_inter_procedural_recursion_limit(tmp_path):
             return a(q)
     """).strip())
     cg = build_call_graph(tmp_path)
-    hits = taint_paths(cg, max_depth=3)
-    # With max_depth=3 the engine can't trace through 7 hops to a sink — and
-    # there's no sink here anyway, so just confirm no crash and 0 hits.
-    assert isinstance(hits, list)
+    shallow = taint_paths(cg, max_depth=3)
+    deep = taint_paths(cg, max_depth=12)
+
+    shallow_sqli = [h for h in shallow if h.sink_kind == "sql_exec"]
+    deep_sqli = [h for h in deep if h.sink_kind == "sql_exec"]
+    assert len(shallow_sqli) == 0, (
+        "max_depth=3 must not reach a sink 7 hops away; "
+        f"got {len(shallow_sqli)} hits"
+    )
+    assert len(deep_sqli) >= 1, (
+        "max_depth=12 should reach the sink at the bottom of the 7-hop "
+        f"chain; got {len(deep_sqli)} hits"
+    )
+    # ...and the path must actually traverse the handler entrypoint, not
+    # be a spurious hit on the helpers in isolation.
+    chained = [
+        h for h in deep_sqli
+        if any("call into" in (step.get("expr", "") or "") for step in h.path)
+    ]
+    assert chained, (
+        "the deep hit must show inter-procedural hops in its path; "
+        f"got paths={[h.path for h in deep_sqli]}"
+    )
 
 
 def test_python_specific_constructs(tmp_path):
-    """f-strings, dict literals, attribute access — all should be parsed."""
+    """f-string interpolation must propagate taint into a downstream
+    ``render_template_string`` call. This is the bread-and-butter Flask
+    XSS shape; if it doesn't fire there's no point shipping the engine.
+    """
     (tmp_path / "weird.py").write_text(textwrap.dedent("""
-        from flask import Flask, request
-        import subprocess
+        from flask import Flask, request, render_template_string
         app = Flask(__name__)
 
-        @app.route("/exec")
+        @app.route("/fstr")
         def handler():
-            data = request.json
-            cmd = data["cmd"]
-            args = {"shell": True, "cmd": cmd}
-            subprocess.run(args["cmd"], shell=args["shell"])
-            return "ok"
+            name = request.args.get("name")
+            body = f"<h1>Hello {name}</h1>"
+            return render_template_string(body)
     """).strip())
     cg = build_call_graph(tmp_path)
-    # Even if dict-subscript taint is hard, the engine shouldn't crash
     hits = taint_paths(cg)
-    assert isinstance(hits, list)
+    template_hits = [
+        h for h in hits if h.sink_kind == "template_render" and "handler" in h.function
+    ]
+    assert len(template_hits) >= 1, (
+        "attacker-controlled f-string flowing into render_template_string "
+        f"must register; got hits={[(h.function, h.sink_kind) for h in hits]}"
+    )

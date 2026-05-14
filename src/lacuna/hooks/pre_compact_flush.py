@@ -27,7 +27,7 @@ import uuid
 # Make lacuna importable when hook is run from .claude/hooks/
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
-from lacuna.kg import open_kg, Hypothesis, Primitive  # noqa: E402
+from lacuna.kg import Hypothesis, Observation, Primitive, open_kg
 
 HYP_BLOCK = re.compile(
     r"<hypothesis-draft>\s*(\{.*?\})\s*</hypothesis-draft>", re.DOTALL
@@ -108,7 +108,11 @@ def main() -> int:
             kg.append_event(agent_name, "precompact_flush_error",
                             {"kind": "primitive", "error": str(e), "data": data})
 
-    # 3. In-flight chain candidates — parked for the chain-builder to resume
+    # 3. In-flight chain candidates — parked for the chain-builder to resume.
+    # Stored as ``observations`` of kind ``chain_candidate_draft`` so the
+    # chain-builder agent finds them through its normal observations API.
+    # (Previous versions wrote to a dedicated ``chain_candidates`` table that
+    # no agent actually read.)
     for match in CHAIN_BLOCK.finditer(transcript):
         data = _safe_json(match.group(1))
         if not data:
@@ -116,19 +120,22 @@ def main() -> int:
         if data.get("status") not in (None, "exploring"):
             continue
         try:
-            with kg.tx() as c:
-                c.execute(
-                    """INSERT OR REPLACE INTO chain_candidates
-                       (id, primitive_ids_json, goal, narrative_so_far, status)
-                       VALUES (?,?,?,?,?)""",
-                    (
-                        data.get("id", f"cand-{uuid.uuid4().hex[:12]}"),
-                        json.dumps(data.get("primitive_ids", [])),
-                        data.get("goal", "unknown"),
-                        data.get("narrative_so_far", ""),
-                        "exploring",
-                    ),
-                )
+            detail = {
+                "primitive_ids": data.get("primitive_ids", []),
+                "narrative_so_far": data.get("narrative_so_far", ""),
+                "draft_id": data.get("id", f"cand-{uuid.uuid4().hex[:12]}"),
+            }
+            obs = Observation(
+                author_agent=agent_name,
+                kind="chain_candidate_draft",
+                summary=(
+                    f"Chain candidate goal={data.get('goal', 'unknown')}"
+                    f" prims={len(detail['primitive_ids'])}"
+                ),
+                detail_md=json.dumps(detail, indent=2),
+                affects_shapes=[],
+            )
+            kg.add_observation(obs)
             flushed["chains"] += 1
         except Exception as e:
             kg.append_event(agent_name, "precompact_flush_error",

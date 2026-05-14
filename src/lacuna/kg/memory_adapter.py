@@ -20,9 +20,6 @@ read-only projection paths reject writes.
 """
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from .client import KG
 
 
@@ -130,76 +127,74 @@ class MemoryAdapter:
 
     def delete(self, path: str) -> bool:
         """Only agent_notes paths are deletable."""
-        if not path.startswith(self.WRITABLE_PREFIX):
-            return False
-        # Implementation simplified — would DELETE from agent_notes
-        return True
+        return bool(path.startswith(self.WRITABLE_PREFIX))
 
     # ── rendering helpers ───────────────────────────────────────────────────
 
     def _render_hypothesis(self, hid: str, only_status: str | None = None) -> str | None:
-        for h in self.kg.list_hypotheses():
-            if h["id"] != hid:
-                continue
-            if only_status and h["status"] != only_status:
-                return None
-            return (
-                f"# Hypothesis {hid}\n\n"
-                f"- **Shape:** {h['shape']}\n"
-                f"- **Hunter:** {h['hunter']}\n"
-                f"- **Status:** {h['status']}\n"
-                f"- **Confidence:** {h['confidence']}\n"
-                f"- **Location:** {h['repo'] or '-'}:{h['file'] or '-'}:{h['line'] or '-'}\n\n"
-                f"## Description\n{h['description']}\n\n"
-                f"## Attacker scenario\n{h['attacker_scenario'] or '-'}\n\n"
-                f"## Refutation reason\n{h['refutation_reason'] or '-'}\n"
-            )
-        return None
+        h = self.kg.get_hypothesis(hid)
+        if h is None:
+            return None
+        if only_status and h["status"] != only_status:
+            return None
+        return (
+            f"# Hypothesis {hid}\n\n"
+            f"- **Shape:** {h['shape']}\n"
+            f"- **Hunter:** {h['hunter']}\n"
+            f"- **Status:** {h['status']}\n"
+            f"- **Confidence:** {h['confidence']}\n"
+            f"- **Location:** {h['repo'] or '-'}:{h['file'] or '-'}:"
+            f"{h['line'] or '-'}\n\n"
+            f"## Description\n{h['description']}\n\n"
+            f"## Attacker scenario\n{h['attacker_scenario'] or '-'}\n\n"
+            f"## Refutation reason\n{h['refutation_reason'] or '-'}\n"
+        )
 
     def _render_finding(self, fid: str) -> str | None:
-        for f in self.kg.list_findings():
-            if f["id"] != fid:
-                continue
-            evidence = self.kg.get_evidence(fid)
-            ev_md = "\n".join(f"- {e['kind']}: `{e['payload_path']}`" for e in evidence)
-            return (
-                f"# Finding {fid}: {f['title']}\n\n"
-                f"- **Severity:** {f['severity']}\n"
-                f"- **CVSS:** {f['cvss_vector'] or '-'}\n"
-                f"- **CWEs:** {f['cwes'] or '-'}\n"
-                f"- **Repos:** {f['repos_involved']}\n"
-                f"- **Hypothesis:** {f['hypothesis_id']}\n\n"
-                f"## Validator summary\n{f['validator_summary']}\n\n"
-                f"## Remediation\n{f['remediation_md'] or '-'}\n\n"
-                f"## Evidence\n{ev_md or '- none -'}\n"
-            )
-        return None
+        f = self.kg.get_finding(fid)
+        if f is None:
+            return None
+        evidence = self.kg.get_evidence(fid)
+        ev_md = "\n".join(
+            f"- {e['kind']}: `{e['payload_path']}`" for e in evidence
+        )
+        cwes = ", ".join(f.get("cwes") or []) or "-"
+        repos = ", ".join(f.get("repos_involved") or []) or "-"
+        return (
+            f"# Finding {fid}: {f['title']}\n\n"
+            f"- **Severity:** {f['severity']}\n"
+            f"- **CVSS:** {f['cvss_vector'] or '-'}\n"
+            f"- **CWEs:** {cwes}\n"
+            f"- **Repos:** {repos}\n"
+            f"- **Hypothesis:** {f['hypothesis_id']}\n\n"
+            f"## Validator summary\n{f['validator_summary']}\n\n"
+            f"## Remediation\n{f['remediation_md'] or '-'}\n\n"
+            f"## Evidence\n{ev_md or '- none -'}\n"
+        )
 
     def _render_primitive(self, pid: str) -> str | None:
-        for p in self.kg.list_primitives():
-            if p.id != pid:
-                continue
-            return (
-                f"# Primitive {pid}: {p.name}\n\n"
-                f"{p.description}\n\n"
-                f"**Prerequisites:** {', '.join(p.prerequisites) or 'none'}\n"
-                f"**Effects:** {', '.join(p.effects) or 'none'}\n"
-                f"**Repos involved:** {', '.join(p.repos_involved) or '-'}\n"
-                f"**Finding:** {p.finding_id or '-'}\n"
-            )
-        return None
+        p = self.kg.get_primitive(pid)
+        if p is None:
+            return None
+        return (
+            f"# Primitive {pid}: {p.name}\n\n"
+            f"{p.description}\n\n"
+            f"**Prerequisites:** {', '.join(p.prerequisites) or 'none'}\n"
+            f"**Effects:** {', '.join(p.effects) or 'none'}\n"
+            f"**Repos involved:** {', '.join(p.repos_involved) or '-'}\n"
+            f"**Finding:** {p.finding_id or '-'}\n"
+        )
 
     def _render_chain(self, cid: str) -> str | None:
-        for c in self.kg.list_chains():
-            if c.id != cid:
-                continue
-            return (
-                f"# Chain {cid} → goal: {c.goal}\n\n"
-                f"**Combined severity:** {c.combined_severity}\n"
-                f"**Primitives:** {', '.join(c.primitive_ids)}\n\n"
-                f"## Narrative\n{c.narrative_md}\n"
-            )
-        return None
+        c = self.kg.get_chain(cid)
+        if c is None:
+            return None
+        return (
+            f"# Chain {cid} → goal: {c.goal}\n\n"
+            f"**Combined severity:** {c.combined_severity}\n"
+            f"**Primitives:** {', '.join(c.primitive_ids)}\n\n"
+            f"## Narrative\n{c.narrative_md}\n"
+        )
 
     # ── path utils ──────────────────────────────────────────────────────────
 

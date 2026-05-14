@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
-
 
 # Patterns for finding signing operations, verification operations,
 # and credential definitions
@@ -160,13 +158,13 @@ def analyze_application(
 
     # Index capabilities by name for cross-repo edge resolution
     cap_by_name: dict[str, list[dict]] = {}
-    for repo_name, rep in per_repo.items():
+    for _repo_name, rep in per_repo.items():
         for cap in rep["capabilities"]:
             cap_by_name.setdefault(cap["asset_name"], []).append(cap)
 
     resolved_edges: list[dict] = []
     unresolved_hints: list[dict] = []
-    for repo_name, rep in per_repo.items():
+    for _repo_name, rep in per_repo.items():
         for edge in rep["edges"]:
             hint = edge["to_capability_hint"]
             matches = cap_by_name.get(hint, [])

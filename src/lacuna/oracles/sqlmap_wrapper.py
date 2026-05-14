@@ -12,12 +12,10 @@ when validator confidence is uncertain after 4 dialectic rounds.
 """
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import tempfile
 from pathlib import Path
-
 
 SQLMAP_BIN = "sqlmap"
 

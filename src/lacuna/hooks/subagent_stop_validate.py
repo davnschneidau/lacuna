@@ -21,7 +21,8 @@ import sys
 
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
-from lacuna.kg import open_kg  # noqa: E402
+from lacuna.hooks import is_orchestrator
+from lacuna.kg import open_kg
 
 
 def _check_recon(kg) -> str | None:
@@ -78,7 +79,7 @@ def _check_validator(kg, hyp_id: str | None) -> str | None:
                     f"Validator confirmed hypothesis {hyp_id} (finding "
                     f"{f['id']}) but did NOT record a minimal_repro. "
                     f"Apply the `minimal-repro` skill and call "
-                    f"kg.write.minimal_repro before stopping."
+                    f"kg_write_minimal_repro before stopping."
                 )
     return None
 
@@ -119,20 +120,12 @@ def _check_orchestrator_global(kg) -> str | None:
             f"First five: {lacking[:5]}"
         )
 
-    # 2. v3 gate: no in-flight fuzz_runs with status=running
-    try:
-        in_flight = kg._conn.execute(
-            "SELECT id FROM fuzz_runs WHERE status = 'running' LIMIT 5",
-        ).fetchall()
-        if in_flight:
-            ids = [r["id"] for r in in_flight]
-            return (
-                f"Cannot terminate: {len(in_flight)} fuzz runs still in "
-                f"flight (e.g. {ids}). Wait for fuzzing-coordinator to "
-                f"finalize them."
-            )
-    except Exception:
-        pass
+    # 2. (removed) Previous versions of this hook queried
+    # ``fuzz_runs WHERE status = 'running'`` but the ``status`` column is
+    # only written with terminal values (``completed | timeout |
+    # build_failed | crashed``), so the check could never fire. The
+    # fuzzing coordinator is responsible for its own concurrency control;
+    # we don't try to second-guess it from the stop hook anymore.
 
     # 3. v3 gate: no unreviewed high-severity precision_findings
     # An "unreviewed" precision finding is one that no hunter has consumed
@@ -216,7 +209,7 @@ def main() -> int:
             # stop on. The global orchestrator check enforces that any
             # hypotheses they wrote get validated.
             block_reason = None
-        elif agent in ("orchestrator", "main", "claude"):
+        elif is_orchestrator(agent):
             # The top-level orchestrator. Apply the final global gates.
             block_reason = _check_orchestrator_global(kg)
 

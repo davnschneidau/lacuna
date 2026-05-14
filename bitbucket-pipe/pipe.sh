@@ -6,7 +6,10 @@
 
 set -euo pipefail
 
-LACUNA_VERSION="1.0.0"
+# Read the canonical version straight out of the Python package so the script
+# never drifts from src/lacuna/__init__.py. ``python3`` must be on PATH; the
+# Lacuna Dockerfile guarantees that.
+LACUNA_VERSION="$(python3 -c 'from lacuna import __version__; print(__version__)' 2>/dev/null || echo 'unknown')"
 LACUNA_HOME="${LACUNA_HOME:-/opt/lacuna}"
 LACUNA_CLAUDE_HOME="${LACUNA_CLAUDE_HOME:-/opt/lacuna/.claude}"
 LACUNA_STATE_DIR="${LACUNA_STATE_DIR:-/state}"

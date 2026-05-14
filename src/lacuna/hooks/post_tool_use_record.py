@@ -12,14 +12,28 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
-import time
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
-from lacuna.kg import open_kg  # noqa: E402
+from lacuna.kg import open_kg
+
+# Restrictive whitelist: only ASCII alphanumerics, dashes, underscores. The
+# previous code embedded ``tool_name`` directly into a filename, so a tool
+# name like ``../../foo`` (which a malicious MCP server could declare)
+# would escape the cache dir.
+_TOOL_NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_tool_name(name: str) -> str:
+    cleaned = _TOOL_NAME_SAFE.sub("_", name or "")
+    # Defence-in-depth: forbid leading dots so the result can't be a
+    # hidden file, and cap length to keep filesystems happy.
+    cleaned = cleaned.lstrip(".") or "tool"
+    return cleaned[:64]
 
 
 def _summarize_result(result: object) -> str:
@@ -46,12 +60,12 @@ def main() -> int:
     evidence_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Persist full payload to cache_dir, store reference in audit log.
     payload_path: str | None = None
+    safe_tool_name = _sanitize_tool_name(tool_name)
     if tool_result is not None:
         payload_bytes = json.dumps(tool_result, default=str).encode()
         h = hashlib.sha256(payload_bytes).hexdigest()[:16]
-        payload_path = str(cache_dir / f"{tool_name}-{h}.json")
+        payload_path = str(cache_dir / f"{safe_tool_name}-{h}.json")
         Path(payload_path).write_bytes(payload_bytes)
 
     kg = open_kg()
@@ -68,7 +82,7 @@ def main() -> int:
         # artifacts for easy attachment to findings later.
         if tool_name.startswith("lacuna-dast.http_request") and isinstance(tool_result, dict):
             ev_id = uuid.uuid4().hex[:12]
-            ev_dir = evidence_dir / f"dast-http-{ev_id}"
+            ev_dir = evidence_dir / f"{safe_tool_name}-{ev_id}"
             ev_dir.mkdir(parents=True, exist_ok=True)
             (ev_dir / "request.json").write_text(
                 json.dumps(tool_args, indent=2, default=str)
