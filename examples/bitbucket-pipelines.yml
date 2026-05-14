@@ -1,0 +1,85 @@
+# Sample bitbucket-pipelines.yml that runs Lacuna against a multi-repo app.
+#
+# Place app.lacuna.yaml at the root of the primary repo. Pipelines runs from
+# that repo; Lacuna clones the other repos at scan time using the Bitbucket
+# credentials below.
+
+image: atlassian/default-image:4
+
+definitions:
+  services:
+    docker:
+      memory: 8192
+
+pipelines:
+  custom:
+    # Nightly full scan, SAST only — fast and quiet.
+    nightly-sast:
+      - step:
+          name: Lacuna SAST scan
+          services: [docker]
+          size: 2x   # 8 GB / 2 vCPU; bump to 4x for very large apps
+          script:
+            - pipe: docker://your-registry.example.com/lacuna:1.0.0
+              variables:
+                LACUNA_MANIFEST: 'app.lacuna.yaml'
+                LACUNA_MODE: 'sast'
+                LACUNA_FAIL_ON: 'critical'
+                AZURE_FOUNDRY_ENDPOINT: $AZURE_FOUNDRY_ENDPOINT
+                AZURE_FOUNDRY_KEY: $AZURE_FOUNDRY_KEY
+                BITBUCKET_USERNAME: $BITBUCKET_USERNAME
+                BITBUCKET_APP_PASSWORD: $BITBUCKET_APP_PASSWORD
+                LACUNA_WALL_CLOCK_HOURS: '4'
+                LACUNA_BUDGET_USD: '50'
+          artifacts:
+            - reports/**
+
+    # Weekly full scan, SAST + DAST against staging.
+    weekly-sast-dast:
+      - step:
+          name: Lacuna SAST+DAST scan against staging
+          services: [docker]
+          size: 4x
+          deployment: staging
+          script:
+            - pipe: docker://your-registry.example.com/lacuna:1.0.0
+              variables:
+                LACUNA_MANIFEST: 'app.lacuna.yaml'
+                LACUNA_MODE: 'sast+dast'
+                LACUNA_FAIL_ON: 'high'
+                AZURE_FOUNDRY_ENDPOINT: $AZURE_FOUNDRY_ENDPOINT
+                AZURE_FOUNDRY_KEY: $AZURE_FOUNDRY_KEY
+                BITBUCKET_USERNAME: $BITBUCKET_USERNAME
+                BITBUCKET_APP_PASSWORD: $BITBUCKET_APP_PASSWORD
+                # DAST credentials — keep them in Repository Variables.
+                DAST_CUSTOMER_EMAIL: $DAST_CUSTOMER_EMAIL
+                DAST_CUSTOMER_PASSWORD: $DAST_CUSTOMER_PASSWORD
+                DAST_CUSTOMER_ALT_EMAIL: $DAST_CUSTOMER_ALT_EMAIL
+                DAST_CUSTOMER_ALT_PASSWORD: $DAST_CUSTOMER_ALT_PASSWORD
+                DAST_SERVICE_TOKEN: $DAST_SERVICE_TOKEN
+                DAST_OOB_TOKEN: $DAST_OOB_TOKEN
+                LACUNA_WALL_CLOCK_HOURS: '6'
+                LACUNA_BUDGET_USD: '100'
+          artifacts:
+            - reports/**
+
+  # On any merge to main, run a fast SAST gate. Fails the build on `critical`.
+  branches:
+    main:
+      - step:
+          name: Lacuna SAST gate
+          services: [docker]
+          size: 2x
+          script:
+            - pipe: docker://your-registry.example.com/lacuna:1.0.0
+              variables:
+                LACUNA_MANIFEST: 'app.lacuna.yaml'
+                LACUNA_MODE: 'sast'
+                LACUNA_FAIL_ON: 'critical'
+                LACUNA_WALL_CLOCK_HOURS: '1'
+                AZURE_FOUNDRY_ENDPOINT: $AZURE_FOUNDRY_ENDPOINT
+                AZURE_FOUNDRY_KEY: $AZURE_FOUNDRY_KEY
+                BITBUCKET_USERNAME: $BITBUCKET_USERNAME
+                BITBUCKET_APP_PASSWORD: $BITBUCKET_APP_PASSWORD
+          artifacts:
+            - reports/**

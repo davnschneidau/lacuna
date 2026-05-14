@@ -1,0 +1,62 @@
+name: Lacuna Security Scanner
+image: lacuna:2.0.0
+description: Agentic, application-level security scanner. SAST and DAST for multi-repo applications, powered by Claude Code through Azure Foundry.
+repository: https://your-bitbucket-workspace/lacuna
+maintainer: security@your-org.example
+tags:
+  - security
+  - sast
+  - dast
+  - agentic
+  - ai
+
+variables:
+  - name: LACUNA_MANIFEST
+    description: Path to the application manifest within the primary repo.
+    default: "app.lacuna.yaml"
+
+  - name: LACUNA_MODE
+    description: Scan mode — sast (default) or sast+dast.
+    default: "sast"
+    allowed-values:
+      - "sast"
+      - "sast+dast"
+
+  - name: LACUNA_FAIL_ON
+    description: Severity threshold that causes a non-zero exit code.
+    default: "critical"
+    allowed-values:
+      - "none"
+      - "critical"
+      - "high"
+      - "medium"
+
+  - name: AZURE_FOUNDRY_ENDPOINT
+    description: Anthropic-compatible Azure AI Foundry endpoint URL.
+
+  - name: AZURE_FOUNDRY_KEY
+    description: Foundry API key. Alternative — AZURE_FOUNDRY_AAD_TOKEN.
+    secured: true
+
+  - name: AZURE_FOUNDRY_AAD_TOKEN
+    description: Entra/AAD bearer token. Mutually exclusive with AZURE_FOUNDRY_KEY.
+    secured: true
+
+  - name: BITBUCKET_USERNAME
+    description: Bitbucket username for cloning additional repos in the manifest.
+
+  - name: BITBUCKET_APP_PASSWORD
+    description: App password paired with BITBUCKET_USERNAME.
+    secured: true
+
+  - name: BITBUCKET_ACCESS_TOKEN
+    description: Alternative — workspace access token (preferred over App Password).
+    secured: true
+
+  - name: LACUNA_WALL_CLOCK_HOURS
+    description: Hard cap on scan wall-clock time.
+    default: "4"
+
+  - name: LACUNA_BUDGET_USD
+    description: Estimated spend cap (Foundry token costs).
+    default: "50"

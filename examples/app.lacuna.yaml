@@ -1,0 +1,156 @@
+# Lacuna application manifest.
+#
+# Describes the multi-repo application Lacuna will scan. Place this file at
+# the root of your primary repo (default location: app.lacuna.yaml) or set
+# LACUNA_MANIFEST to its path.
+
+application:
+  name: ExampleShop
+  description: |
+    Multi-service e-commerce app. Public storefront, internal API, async
+    workers, and a small admin console. Single Postgres, single Redis.
+  bitbucket_workspace: example-corp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Repos that compose the application.
+#
+# `role` is informational but influences agent prioritization (services with
+# role=public-frontend get extra hunter attention; role=internal-only services
+# trigger cross-service hypotheses when reached from public ones).
+#
+# `exposes` enumerates the network surfaces. Trust boundaries are declared
+# below, referring to these names.
+# ─────────────────────────────────────────────────────────────────────────────
+repos:
+  - name: storefront
+    slug: storefront
+    workspace: example-corp     # optional; defaults to application.bitbucket_workspace
+    ref: main
+    role: public-frontend
+    runtime: node-20
+    exposes:
+      - http_443_public          # publicly reachable on the internet
+
+  - name: order-api
+    slug: order-api
+    ref: main
+    role: backend-api
+    runtime: python-3.11
+    exposes:
+      - http_8080_internal       # only reachable from inside the cluster
+
+  - name: payments-svc
+    slug: payments-svc
+    ref: main
+    role: backend-api
+    runtime: go-1.22
+    exposes:
+      - http_8081_internal
+
+  - name: auth-svc
+    slug: auth-svc
+    ref: main
+    role: identity
+    runtime: java-21
+    exposes:
+      - http_8082_internal
+
+  - name: worker
+    slug: worker
+    ref: main
+    role: background-worker
+    runtime: python-3.11
+    # No external exposure; subscribes to SQS queues only.
+
+  - name: admin-console
+    slug: admin-console
+    ref: main
+    role: internal-tool
+    runtime: node-20
+    exposes:
+      - http_4443_vpn-only       # behind VPN; treat as internal
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trust boundaries. Each boundary is a named perimeter. Surfaces inside the
+# perimeter share trust; surfaces crossing it must authenticate/authorize.
+# ─────────────────────────────────────────────────────────────────────────────
+trust_boundaries:
+  - name: internet
+    description: |
+      The public internet. Anything reachable here is reachable by any
+      attacker on day zero, with zero prior knowledge.
+    surfaces:
+      - storefront:http_443_public
+
+  - name: cluster-internal
+    description: |
+      Inside the Kubernetes cluster. Reachable by any pod, including
+      compromised ones. Service-to-service auth required for sensitive APIs.
+    surfaces:
+      - order-api:http_8080_internal
+      - payments-svc:http_8081_internal
+      - auth-svc:http_8082_internal
+
+  - name: vpn-only
+    description: |
+      Reachable only through corporate VPN. Treat as low-likelihood-but-still-
+      adversarial — VPN credentials get phished, contractors get hired.
+    surfaces:
+      - admin-console:http_4443_vpn-only
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scan configuration.
+# ─────────────────────────────────────────────────────────────────────────────
+scan:
+  sast:
+    # Tunable; defaults are sensible.
+    max_subagent_parallel: 8
+    hypothesis_min_confidence_for_validation: 0.3
+    validator_max_rounds: 4
+
+  dast:
+    # DAST settings only apply when LACUNA_MODE=sast+dast.
+    target:
+      # The publicly-reachable surface of your application. Lacuna will only
+      # send DAST requests to hosts matching these patterns.
+      allowed_hosts:
+        - "storefront.example.com"
+        - "*.staging.example.com"
+
+    auth:
+      # Auth flows that DAST may invoke before fuzzing. Names are arbitrary;
+      # agents reference them by name in `auth_login(flow_name=...)`.
+      flows:
+        - name: customer
+          kind: form-login
+          login_url: "https://storefront.staging.example.com/login"
+          body:
+            email: "$env:DAST_CUSTOMER_EMAIL"
+            password: "$env:DAST_CUSTOMER_PASSWORD"
+          follow_redirects: true
+
+        - name: customer-alt
+          kind: form-login
+          login_url: "https://storefront.staging.example.com/login"
+          body:
+            email: "$env:DAST_CUSTOMER_ALT_EMAIL"
+            password: "$env:DAST_CUSTOMER_ALT_PASSWORD"
+
+        - name: service-bearer
+          kind: bearer-static
+          token_env: DAST_SERVICE_TOKEN
+
+    oob:
+      # Out-of-band callback collector for blind-exploit confirmation.
+      # See docs/CONTEXT_STRATEGY.md for collector contract.
+      collector_url: "https://oob.example.com"
+      dns_zone: "oob.example.com"
+      auth_header: "Authorization: Bearer ${DAST_OOB_TOKEN}"
+
+    safety:
+      # Destructive HTTP verbs are denied by default. To permit specific
+      # methods, list them here; the PreToolUse hook will allow them.
+      destructive_methods: deny
+      allowed_destructive_methods: []
+      # Per-target rate cap (requests per second).
+      rate_limit_rps: 10

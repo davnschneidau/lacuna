@@ -1,0 +1,96 @@
+{
+  "_comment": "Lacuna's Claude Code configuration. Wires hooks, configures context management, declares permitted tools.",
+
+  "model": "${LACUNA_MODEL_OPUS}",
+  "smallFastModel": "${LACUNA_MODEL_HAIKU}",
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "python3 -m lacuna.hooks.session_start"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "command": "python3 -m lacuna.hooks.user_prompt_submit_inject_status"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "command": "python3 -m lacuna.hooks.pre_tool_use_gate"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "command": "python3 -m lacuna.hooks.post_tool_use_record"
+      }
+    ],
+    "PreCompact": [
+      {
+        "command": "python3 -m lacuna.hooks.pre_compact_flush"
+      }
+    ],
+    "SubagentStop": [
+      {
+        "command": "python3 -m lacuna.hooks.subagent_stop_validate"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "python3 -m lacuna.hooks.stop_continuation"
+      }
+    ]
+  },
+
+  "context": {
+    "_comment": "Compaction settings. Trigger at 70% so we still have room to write a full pre-compact flush.",
+    "compactThresholdRatio": 0.70,
+    "compactionPromptOverride": "You are about to compact a long transcript from Lacuna's orchestrator. Lacuna has a knowledge graph (KG) that is the durable source of truth for findings, hypotheses, primitives, chains, and the application model. Your job in the compact is NOT to summarize all reasoning. Your job is to: 1) preserve any *in-flight* hypotheses, primitives, or chain candidates that have not yet been written to the KG (these are wrapped in <hypothesis-draft>, <primitive-draft>, <chain-candidate> tags); 2) preserve the most recent <next-actions> block verbatim; 3) preserve any active subagent context (which subagent is running, what it was asked to do, what it has not yet returned); 4) discard anything redundant with the KG (confirmed findings, completed primitives, etc.) since the agent can re-read them via kg.read.* tools. Keep the compact under 3000 tokens.",
+
+    "toolResultClearing": {
+      "enabled": true,
+      "keepRecent": 4,
+      "_comment": "Clear stale tool results to keep context lean. Recon and DAST tools return summary+handles+payload_ref; agents fetch full payloads on demand via fetch_payload."
+    }
+  },
+
+  "permissions": {
+    "_comment": "PreToolUse hook is the real gate. Listing tools here for visibility.",
+    "allowedTools": [
+      "mcp__lacuna-recon__*",
+      "mcp__lacuna-kg__*",
+      "mcp__lacuna-dast__*",
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash",
+      "Task"
+    ]
+  },
+
+  "subagents": {
+    "_comment": "Subagent contracts: token caps applied on spawn and on return. Hunter inputs are capped tight; chain-builder runs on a primitives-only context. v2 adds per-phase parallelism: recon-per-repo, hunter × repo matrix, validators concurrent, DAST per allowed-host, skeptic per finding.",
+    "maxParallel": 8,
+    "perPhaseParallel": {
+      "recon": 8,
+      "hunters": 8,
+      "validators": 8,
+      "dast": 4,
+      "skeptic": 8,
+      "trust_shadow": 1,
+      "chain_builder": 1
+    },
+    "speculativeReopenCap": 2,
+    "incrementalChainBuilderTriggerPrimitives": 5,
+    "defaults": {
+      "maxInputTokens": 12000,
+      "maxOutputTokens": 4000
+    },
+    "perAgent": {
+      "skeptic": {"maxInputTokens": 30000, "maxOutputTokens": 4000},
+      "trust-shadow-analyzer": {"maxInputTokens": 80000, "maxOutputTokens": 16000}
+    }
+  }
+}

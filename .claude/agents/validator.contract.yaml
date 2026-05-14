@@ -1,0 +1,24 @@
+name: validator
+input_caps:
+  max_input_tokens: 16000
+  must_include_in_context:
+    - "/memory/application_model.md"
+    - "/memory/pending_hypotheses/{hypothesis_id}.md"
+  must_not_include_in_context:
+    - "/memory/confirmed_findings/"
+    - "/memory/refuted_hypotheses/"
+    - "raw subagent transcripts"
+output_caps:
+  max_output_tokens: 6000
+rounds:
+  max: 4
+  per_round_max_tokens: 2000
+expected_outputs:
+  - "kg.write.update_hypothesis_status to one of: confirmed, refuted, needs_human"
+  - "If confirmed: kg.write.finding, at least one kg.write.primitive, attach_evidence as appropriate"
+  - "If confirmed: kg.write.minimal_repro MUST be called after minimization (see skill: minimal-repro)"
+  - "If refuted: refutation_reason citing specific code / framework behavior"
+post_confirmation_required:
+  - "Before SubagentStop, every confirmed finding must have a minimal_repro recorded"
+  - "Hook subagent_stop_validate.py will refuse termination otherwise"
+

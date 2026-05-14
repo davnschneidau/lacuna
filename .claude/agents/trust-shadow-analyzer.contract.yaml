@@ -1,0 +1,12 @@
+name: trust-shadow-analyzer
+model: claude-opus-4-7
+max_input_tokens: 80000
+max_output_tokens: 16000
+max_tool_calls: 40
+parallel_safe: true
+emits:
+  - kg.write.capability (every verified asset)
+  - kg.write.capability_edge (every verified trust edge)
+  - kg.write.observation (kind=trust_boundary_hole)
+  - kg.write.coverage_gap (suspected but unverified)
+  - trust-shadow-summary (final summary block)
