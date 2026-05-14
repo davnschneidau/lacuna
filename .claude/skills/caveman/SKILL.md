@@ -2,7 +2,8 @@
 name: caveman
 description: |
   Default communication style for all Lacuna agents. Terse, decisive,
-  fact-dense. What was cut is *ceremony*, not content.
+  fact-dense. No token budget concerns.
+  What we cut is *ceremony*, not content.
 ---
 
 # Caveman

@@ -65,18 +65,43 @@ operates on ONE repo at a time so they can be parallelized. The full hunter
 list (8 shapes) × N repos can be many tasks; respect
 `LACUNA_MAX_PARALLEL_SUBAGENTS` and queue the rest.
 
+**v3 addition — Layer 2 precision pre-pass.** Before the standard hunter
+matrix, run the precision tools across each repo. They produce
+`precision_findings` (Layer 2 leads) that hunters consume:
+
+```
+For each repo:
+  integer_range_analysis(repo)     # CWE-190/789
+  lifetime_analysis(repo)          # CWE-416/415 (C/C++/ObjC only)
+  format_string_sinks(repo)        # CWE-134/117
+  type_confusion_sites(repo)       # CWE-843
+  allocator_map(repo)              # metadata for above
+```
+
+Run them as part of recon (Phase 1) — they're fast (~30s per repo) and
+their findings inform hunter prioritization.
+
+**v3 addition — Patch archaeology in parallel.** Also during Phase 2,
+spawn `patch-archaeologist` once per repo. This agent reads recent
+security commits, extracts the bug-class essence from each, generates
+propagation rules, and runs them across the codebase to find variants.
+Variants become hypotheses at confidence 0.6 with parent_finding_id set
+to the originating commit SHA.
+
 **Every hunter MUST**:
 1. At start, call `kg.read.observations(shape=<their-shape>)` to load any
-   facts other hunters have already published. (See the
-   `cross-hunter-observations` skill.)
-2. Prefer `data_flow_paths(repo, source_kind, sink_kind)` over grep for
-   any source-to-sink question. The new inter-procedural taint engine
-   resolves cross-file flow and respects sanitizers.
-3. Use `reachable_from` and `callers_of` to quickly refute "is X reachable
+   facts other hunters have already published.
+2. **v3**: Also call `kg.read.precision_findings(kind=<relevant>,
+   unconsumed_only=true)` for high-quality leads matching their bug
+   class. Convert leads into hypotheses (mark consumed via the KG client
+   when done).
+3. Prefer `data_flow_paths(repo, source_kind, sink_kind)` over grep for
+   any source-to-sink question.
+4. Use `reachable_from` and `callers_of` to quickly refute "is X reachable
    from any handler" questions.
-4. Consult `known_gadgets(language, library)` whenever a sink is a known
+5. Consult `known_gadgets(language, library)` whenever a sink is a known
    gadget pattern.
-5. When confirming a non-hypothesis fact (sanitizer bypass, middleware
+6. When confirming a non-hypothesis fact (sanitizer bypass, middleware
    quirk, shared resource), write `kg.write.observation`.
 
 Hunters write hypotheses to the KG via `kg.write.hypothesis`. The KG
@@ -99,6 +124,57 @@ for up to 4 rounds. On confirmation it MUST:
 
 If the validator is uncertain after 4 rounds, it may invoke a **deep
 oracle** via DAST: `oracle_sqlmap`, `oracle_ysoserial`, `oracle_gopherus`.
+
+**v3 addition — fuzz before refuting (when applicable).** If the
+hypothesis bug class is in {CWE-190, CWE-416, CWE-415, CWE-787, CWE-122,
+CWE-125, CWE-369, CWE-476, CWE-843} AND the target repo is in a fuzzable
+language (C/C++/Rust/Go), validators that reach the "about to refute"
+state at round 3-4 MUST first emit a request for `fuzzing-coordinator`
+to fuzz the candidate function. If a fuzzer crash returns matching the
+bug class, the verdict must NOT be `refuted` — see `trust-the-fuzzer`
+skill.
+
+### Phase 3.5 — Dynamic confirmation pass (v3, new)
+
+After Phase 3 has produced its first batch of validator results, spawn
+`fuzzing-coordinator` ONCE per scan. The coordinator:
+
+1. Reads `kg.read.precision_findings(unconsumed_only=true)` + active
+   hypotheses with `confidence in (0.4, 0.8)` (the uncertain band).
+2. Filters to fuzzable languages (C/C++ for now; Rust/Go later).
+3. For each target repo, calls `sanitizer_build(repo)` if no recent
+   build exists. Memoized in `sanitizer_builds` KG table — re-uses
+   prior builds at the same git_sha.
+4. Allocates `LACUNA_FUZZ_BUDGET_MINUTES` (default 60) across the
+   shortlist by expected yield (precision findings > hypotheses,
+   high-CWE-density > low).
+5. Calls `fuzz_function(repo, function, signature, library_path,
+   timeout_seconds, triggered_by)` per chosen target.
+6. For each crash, attaches evidence to the parent hypothesis via
+   `kg.write.attach_evidence`. The validator picks it up on its next
+   round; a matching ASan kind upgrades verdict to `confirmed` at high
+   confidence.
+
+The coordinator MUST stay under budget. Skipped targets get an event
+record so the next scan can resume.
+
+### Phase 3.6 — Variant hunting (v3, new)
+
+When the validator confirms a finding (writes a `confirmed` verdict +
+minimal_repro), automatically spawn `variant-hunter` against that
+finding. The variant-hunter:
+
+1. Reads the confirmed finding via `kg.read.findings`.
+2. Generates a propagation rule from the bug pattern (or reuses the
+   patch_rule if the finding came from patch-archaeology).
+3. Calls `propagate_pattern` across the repo.
+4. Creates child hypotheses at confidence 0.65 for each match.
+5. Links each child via `kg.write.variant_link(child_hyp_id,
+   parent_finding_id)`.
+
+Child variants re-enter Phase 3 (validation) like any other hypothesis.
+Empirically variants land 1.5-4× per parent confirmation. Hard cap at
+30 variants per parent to bound runaway.
 
 ### Phase 3b — Incremental chain-building (continuous)
 
@@ -127,17 +203,25 @@ Cap: at most 2 re-opens per chain candidate, to bound runaway.
    finding ≥ medium and emits a verdict (confirmed / downgrade / refuted /
    needs_human). See the `skeptic` agent.
 
+   **v3 addition:** if `kg.read.fuzz_crashes` returns a crash whose
+   `asan_kind` matches the finding's bug class, the skeptic verdict
+   cannot be `refuted` (downgrade still allowed). The crash is ground
+   truth.
+
 2. Generate reports. Invoke `report-exec` and `report-tech`. Or call
    `python3 -m lacuna report --reports-dir /reports`. Set
-   `reports_generated`.
+   `reports_generated`. v3 reports include Known-Variant Clusters,
+   Crash Reproductions, and Incomplete-Fix sections.
 
 3. Attempt to stop. The Stop hook checks:
    - `application_model_ready`
    - all hunters returned
    - all hypotheses resolved
    - chain search exhausted
-   - **NEW**: every confirmed finding has a `minimal_repro`
-   - **NEW**: skeptic has reviewed every medium+ finding
+   - every confirmed finding has a `minimal_repro`
+   - skeptic has reviewed every medium+ finding
+   - **v3**: no in-flight `fuzz_runs` with status=`running`
+   - **v3**: no unreviewed high-severity `precision_findings`
    - `reports_generated`
 
 ### Parallelism rules (cheat sheet)
@@ -147,8 +231,11 @@ Cap: at most 2 re-opens per chain candidate, to bound runaway.
 | 1 — Recon | per repo | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
 | 1b — Trust-shadow | 1 | n/a (single agent) |
 | 2 — Hunters | per (shape, repo) | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
+| 2b — Patch archaeology (v3) | per repo | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
 | 3 — Validators | per hypothesis | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
 | 3 — DAST | per distinct allowed_host | `LACUNA_MAX_PARALLEL_SUBAGENTS / 2` |
+| 3.5 — Fuzzing coordinator (v3) | 1 | n/a (single agent, internal parallelism) |
+| 3.6 — Variant hunter (v3) | per confirmed finding | `LACUNA_MAX_PARALLEL_SUBAGENTS / 2` |
 | 4 — Skeptic | per finding | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
 
 ## Operating principles

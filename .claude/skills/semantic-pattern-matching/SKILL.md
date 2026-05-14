@@ -47,10 +47,10 @@ Across all shapes:
 
 - **High confidence (>= 0.7)**: source is named, sink is named, no obvious
   mitigation, and the framework/library is known not to handle this by default.
-- **Medium confidence (0.4 - 0.7)**: source and sink are named, but there's
+- **Medium confidence (0.4 – 0.7)**: source and sink are named, but there's
   *something* in the path (a sanitizer, a typed binding, a sandbox) that
   might be sufficient — the validator should decide.
-- **Low confidence (0.2 - 0.4)**: pattern matches but key context is missing
+- **Low confidence (0.2 – 0.4)**: pattern matches but key context is missing
   (you don't know if the source is actually reachable, or the sink is
   actually invoked).
 - **Below 0.2**: don't write a hypothesis. Form a stronger one or move on.

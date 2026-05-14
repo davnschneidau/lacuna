@@ -25,7 +25,7 @@ from jinja2 import Environment, StrictUndefined
 from ..kg import open_kg
 from .sarif_emitter import emit_sarif
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 
 
 def _read_template(name: str) -> str:
@@ -254,9 +254,134 @@ def _tech_context(kg) -> dict[str, Any]:
             for o in kg.list_observations()
             if o["kind"] not in ("trust_boundary_hole",)
         ][:100],
+        # ─── v3 additions ─────────────────────────────────────────────────
+        "variant_clusters": _collect_variant_clusters(kg, findings_full),
+        "crash_reproductions": _collect_crash_reproductions(kg, findings_full),
+        "incomplete_fixes": _collect_incomplete_fixes(kg, all_hyps),
+        "precision_findings_summary": _summarize_precision_findings(kg),
         "version": VERSION,
         "kg_path": os.environ.get("LACUNA_KG_PATH", "/state/lacuna.db"),
     }
+
+
+# ─── v3 report-section helpers ─────────────────────────────────────────────
+
+def _collect_variant_clusters(kg, findings: list[dict]) -> list[dict]:
+    """Group findings into parent → children variant clusters."""
+    clusters: list[dict] = []
+    for f in findings:
+        variants = kg.list_variants_of(f["id"])
+        if not variants:
+            continue
+        # Resolve child hypothesis locations
+        children: list[dict] = []
+        for v in variants:
+            hyp = next(
+                (h for h in kg.list_hypotheses()
+                 if h["id"] == v["child_hyp_id"]),
+                None,
+            )
+            if hyp:
+                children.append({
+                    "hyp_id": v["child_hyp_id"],
+                    "location": f"{hyp.get('file', '?')}:{hyp.get('line', '?')}",
+                    "verdict": hyp.get("status"),
+                })
+        if children:
+            clusters.append({
+                "parent_finding_id": f["id"],
+                "parent_title": f["title"],
+                "parent_location": _finding_location(f),
+                "cwe": (f.get("cwes") or ["?"])[0]
+                          if isinstance(f.get("cwes"), list) else "?",
+                "children": children,
+            })
+    return clusters
+
+
+def _collect_crash_reproductions(
+    kg, findings: list[dict],
+) -> list[dict]:
+    """For each finding with attached fuzz evidence, surface the crash."""
+    out: list[dict] = []
+    for f in findings:
+        ev = f.get("evidence") or []
+        # Find evidence rows whose payload mentions a fuzz_crash
+        fuzz_crashes = [
+            e for e in ev
+            if e.get("kind") in ("fuzz_crash", "asan_report")
+            or "asan_kind" in str(e.get("payload", ""))
+        ]
+        if not fuzz_crashes:
+            continue
+        for e in fuzz_crashes[:3]:
+            payload = e.get("payload") or {}
+            if isinstance(payload, str):
+                try:
+                    import json as _j
+                    payload = _j.loads(payload)
+                except Exception:
+                    payload = {}
+            out.append({
+                "finding_id": f["id"],
+                "function_qual": payload.get("function_qual", "?"),
+                "asan_kind": payload.get("asan_kind", "unknown"),
+                "fuzz_run_id": payload.get("fuzz_run_id", "?"),
+                "executions": payload.get("executions"),
+                "duration_s": payload.get("duration_s"),
+                "input_path": payload.get("input_path", "?"),
+                "minimized_input_path": payload.get("minimized_input_path"),
+                "asan_log_path": payload.get("asan_log_path", "?"),
+                "crash_stack": payload.get("crash_stack", []),
+            })
+    return out
+
+
+def _collect_incomplete_fixes(kg, all_hyps: list[dict]) -> list[dict]:
+    """Hypotheses whose source_hunter was patch-archaeologist."""
+    out: list[dict] = []
+    for h in all_hyps:
+        if h.get("source_hunter") not in ("patch-archaeologist",):
+            continue
+        out.append({
+            "hyp_id": h["id"],
+            "location": f"{h.get('file', '?')}:{h.get('line', '?')}",
+            "parent_commit_short": (h.get("parent_finding_id") or "?")[:10],
+            "bug_class": h.get("cwe", "?"),
+            "verdict": h.get("status"),
+        })
+    return out
+
+
+def _summarize_precision_findings(kg) -> list[dict]:
+    """Per-kind summary of precision findings + consumption rate."""
+    rows = kg.list_precision_findings()
+    from collections import Counter
+    by_kind: dict[tuple, int] = Counter()
+    consumed_by_kind: dict[tuple, int] = Counter()
+    for r in rows:
+        key = (r["kind"], r.get("cwe") or "?")
+        by_kind[key] += 1
+        if r.get("consumed_by_hyp"):
+            consumed_by_kind[key] += 1
+    return [
+        {
+            "kind": k[0], "cwe": k[1],
+            "count": by_kind[k],
+            "consumed": consumed_by_kind.get(k, 0),
+        }
+        for k in sorted(by_kind, key=lambda x: -by_kind[x])
+    ]
+
+
+def _finding_location(f: dict) -> str:
+    """Best-effort location string from a finding's evidence."""
+    ev = f.get("evidence") or []
+    for e in ev:
+        payload = e.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("file"):
+            return f"{payload['file']}:{payload.get('line', '?')}"
+    return "?"
 
 
 def _find_capability_holder(kg, cap_id: str | None) -> str | None:

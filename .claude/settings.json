@@ -80,17 +80,24 @@
       "dast": 4,
       "skeptic": 8,
       "trust_shadow": 1,
-      "chain_builder": 1
+      "chain_builder": 1,
+      "patch_archaeologist": 8,
+      "variant_hunter": 4,
+      "fuzzing_coordinator": 1
     },
     "speculativeReopenCap": 2,
     "incrementalChainBuilderTriggerPrimitives": 5,
+    "variantHunterMaxChildrenPerParent": 30,
     "defaults": {
       "maxInputTokens": 12000,
       "maxOutputTokens": 4000
     },
     "perAgent": {
       "skeptic": {"maxInputTokens": 30000, "maxOutputTokens": 4000},
-      "trust-shadow-analyzer": {"maxInputTokens": 80000, "maxOutputTokens": 16000}
+      "trust-shadow-analyzer": {"maxInputTokens": 80000, "maxOutputTokens": 16000},
+      "patch-archaeologist": {"maxInputTokens": 15000, "maxOutputTokens": 6000},
+      "variant-hunter": {"maxInputTokens": 12000, "maxOutputTokens": 6000},
+      "fuzzing-coordinator": {"maxInputTokens": 14000, "maxOutputTokens": 5000}
     }
   }
 }

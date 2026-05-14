@@ -532,6 +532,114 @@ async def list_tools() -> list[Tool]:
             "even when neither side is buggy in isolation."
         ), inputSchema={"type": "object", "properties": {}, "required": []}),
 
+        # ─── v3: Layer 2 precision static analysis ───────────────────────
+        Tool(name="integer_range_analysis", description=(
+            "Detect CWE-190/789 integer overflow and oversized-allocation "
+            "patterns: allocations whose size expression derives from "
+            "attacker-controlled values without bound checks. Writes "
+            "precision_findings to the KG. Returns count and a sample."
+        ), inputSchema={
+            "type": "object",
+            "properties": {"repo": {"type": "string"}},
+            "required": ["repo"],
+        }),
+
+        Tool(name="lifetime_analysis", description=(
+            "Detect CWE-416 use-after-free and CWE-415 double-free patterns "
+            "in C/C++/Obj-C. Tracks alloc/free per function. Writes "
+            "precision_findings. Returns count and samples."
+        ), inputSchema={
+            "type": "object",
+            "properties": {"repo": {"type": "string"}},
+            "required": ["repo"],
+        }),
+
+        Tool(name="format_string_sinks", description=(
+            "Detect CWE-134 printf-family with non-literal format and "
+            "CWE-117 logger calls that may template-interpret attacker "
+            "input (Log4Shell shape). Cross-references log4j-core "
+            "version from dependency_graph when available."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "languages": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["repo"],
+        }),
+
+        Tool(name="type_confusion_sites", description=(
+            "Detect CWE-843 type confusion: casts, type assertions, and "
+            "coercions across trust boundaries without runtime guarantees. "
+            "Covers Python pickle, Java deserialize+cast, C++ "
+            "reinterpret_cast on buffer pointers, Go panic-on-fail "
+            "type assertions, TypeScript `as T`."
+        ), inputSchema={
+            "type": "object",
+            "properties": {"repo": {"type": "string"}},
+            "required": ["repo"],
+        }),
+
+        Tool(name="allocator_map", description=(
+            "Identify what allocators are in use across the codebase: "
+            "standard malloc/free, kmalloc with GFP flags, custom "
+            "*_alloc/*_free pairs, smart pointers, reference counting. "
+            "Metadata for other precision tools — not a finding generator."
+        ), inputSchema={
+            "type": "object",
+            "properties": {"repo": {"type": "string"}},
+            "required": ["repo"],
+        }),
+
+        # ─── v3: Layer 3 dynamic confirmation ────────────────────────────
+        Tool(name="sanitizer_build", description=(
+            "Auto-detect the project's build system (cmake, make, autotools, "
+            "meson, cargo, ...) and run a sanitizer-instrumented build with "
+            "ASan + UBSan. Returns built binaries, status, and any sanitizer "
+            "warnings caught at compile time. Memoized in KG by repo+git_sha. "
+            "PRECONDITION for fuzz_function."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "sanitizers": {"type": "string",
+                                "default": "asan,ubsan"},
+                "timeout_seconds": {"type": "integer", "default": 1800},
+            },
+            "required": ["repo"],
+        }),
+
+        # ─── v3: Layer 4 patch infrastructure ────────────────────────────
+        Tool(name="patch_essence", description=(
+            "Given a git commit SHA in a repo, extract the bug-class "
+            "abstraction: files changed, removed dangerous patterns, added "
+            "safety guards, and a semgrep-style rule that matches the "
+            "BEFORE state. Output suitable for propagate_pattern. The "
+            "rule lives in the patch_rules KG table."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "commit_sha": {"type": "string"},
+            },
+            "required": ["repo", "commit_sha"],
+        }),
+
+        Tool(name="propagate_pattern", description=(
+            "Run a previously-generated rule (from patch_essence or a "
+            "confirmed finding) across the codebase to find variants of "
+            "the same bug class. Returns matching file:line sites. "
+            "Variants become child hypotheses for the validator."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "rule_yaml": {"type": "string"},
+                "rule_id": {"type": "string"},
+            },
+            "required": ["repo"],
+        }),
+
         Tool(name="fetch_payload", description=(
             "Retrieve a large tool payload from the off-context cache by handle. "
             "Use after seeing a payload_ref in a previous tool result."
@@ -634,6 +742,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _tool_known_gadgets(arguments)
         if name == "trust_shadow_analyze":
             return _tool_trust_shadow_analyze()
+        # ─── v3 Layer 2 ──
+        if name == "integer_range_analysis":
+            return _tool_integer_range_analysis(arguments)
+        if name == "lifetime_analysis":
+            return _tool_lifetime_analysis(arguments)
+        if name == "format_string_sinks":
+            return _tool_format_string_sinks(arguments)
+        if name == "type_confusion_sites":
+            return _tool_type_confusion_sites(arguments)
+        if name == "allocator_map":
+            return _tool_allocator_map(arguments)
+        # ─── v3 Layer 3 ──
+        if name == "sanitizer_build":
+            return _tool_sanitizer_build(arguments)
+        # ─── v3 Layer 4 ──
+        if name == "patch_essence":
+            return _tool_patch_essence(arguments)
+        if name == "propagate_pattern":
+            return _tool_propagate_pattern(arguments)
         if name == "fetch_payload":
             return _tool_fetch_payload(arguments)
     except Exception as e:
@@ -1815,6 +1942,330 @@ def _tool_trust_shadow_analyze() -> list[TextContent]:
             "unresolved_hints": len(result["unresolved_hints"]),
         },
         "cross_repo_trust_paths": result["cross_repo_trust_paths"][:50],
+    })
+
+
+def _tool_fetch_payload(args: dict) -> list[TextContent]:
+    ref = args["payload_ref"]
+    page = int(args.get("page", 0))
+    page_size = int(args.get("page_size_bytes", 32000))
+    p = Path(ref)
+    if not p.exists() or not str(p).startswith(str(TOOL_CACHE)):
+        return _err(f"unknown payload_ref: {ref}")
+    raw = p.read_text()
+    start = page * page_size
+    end = start + page_size
+    return _ok({
+        "summary": f"payload chunk page={page} bytes={start}..{end} of {len(raw)}",
+        "chunk": raw[start:end],
+        "more": end < len(raw),
+        "next_page": page + 1 if end < len(raw) else None,
+    })
+
+
+# ─── v3 Layer 2: precision tool implementations ────────────────────────────
+
+def _resolve_repo_root(repo_name: str) -> Path | None:
+    """Find a repo directory by manifest name, falling back to workspace."""
+    manifest = _load_manifest()
+    for r in manifest.get("repos", []):
+        if r.get("name") == repo_name:
+            return WORKSPACE / r.get("path", repo_name)
+    candidate = WORKSPACE / repo_name
+    if candidate.is_dir():
+        return candidate
+    return None
+
+
+def _persist_precision_findings(findings: list[dict]) -> None:
+    """Write precision findings to the KG."""
+    try:
+        from lacuna.kg import open_kg
+        kg = open_kg()
+        for f in findings:
+            kg.add_precision_finding(
+                kind=f["kind"],
+                repo=f["repo"], file=f["file"], line=f["line"],
+                function_qual=f.get("function_qual"),
+                cwe=f.get("cwe"),
+                detail_md=f["detail_md"],
+                evidence=f.get("evidence", {}),
+                confidence=f["confidence"],
+                cve_hint=f.get("cve_hint"),
+            )
+        kg.close()
+    except Exception:
+        # KG persistence is opportunistic; tool still returns its findings
+        pass
+
+
+def _tool_integer_range_analysis(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    from lacuna.precision import analyze_integer_range
+    result = analyze_integer_range(root, repo_name=repo)
+    _persist_precision_findings(result["findings"])
+    return _ok({
+        "summary": result["summary"],
+        "facets": _facet_findings(result["findings"]),
+        "findings_count": len(result["findings"]),
+        "sample": result["findings"][:5],
+    })
+
+
+def _tool_lifetime_analysis(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    from lacuna.precision import analyze_lifetime
+    result = analyze_lifetime(root, repo_name=repo)
+    _persist_precision_findings(result["findings"])
+    return _ok({
+        "summary": result["summary"],
+        "facets": _facet_findings(result["findings"]),
+        "findings_count": len(result["findings"]),
+        "sample": result["findings"][:5],
+    })
+
+
+def _tool_format_string_sinks(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    # Cross-reference dependency_graph for log4j version hint
+    dep_hint = _extract_dep_hint(repo)
+    from lacuna.precision import analyze_format_string
+    result = analyze_format_string(
+        root, repo_name=repo,
+        languages=args.get("languages"),
+        dependency_hint=dep_hint,
+    )
+    _persist_precision_findings(result["findings"])
+    return _ok({
+        "summary": result["summary"],
+        "facets": _facet_findings(result["findings"]),
+        "findings_count": len(result["findings"]),
+        "sample": result["findings"][:5],
+    })
+
+
+def _tool_type_confusion_sites(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    from lacuna.precision import analyze_type_confusion
+    result = analyze_type_confusion(root, repo_name=repo)
+    _persist_precision_findings(result["findings"])
+    return _ok({
+        "summary": result["summary"],
+        "facets": _facet_findings(result["findings"]),
+        "findings_count": len(result["findings"]),
+        "sample": result["findings"][:5],
+    })
+
+
+def _tool_allocator_map(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    from lacuna.precision import analyze_allocator_map
+    result = analyze_allocator_map(root, repo_name=repo)
+    return _ok({
+        "summary": result["summary"],
+        "global_allocators": result["global_allocators"],
+        "custom_pairs": result["custom_pairs"],
+        "gfp_flags": result.get("gfp_flags", {}),
+    })
+
+
+def _facet_findings(findings: list[dict]) -> dict:
+    """Group findings by kind+CWE for compact UI display."""
+    from collections import Counter
+    facets: dict[str, int] = Counter()
+    for f in findings:
+        key = f"{f.get('kind','?')}:{f.get('cwe','?')}"
+        facets[key] += 1
+    return dict(facets)
+
+
+def _extract_dep_hint(repo: str) -> dict:
+    """Pull dependency_graph hints from the KG to inform precision tools."""
+    try:
+        from lacuna.kg import open_kg
+        kg = open_kg()
+        rows = kg._conn.execute(
+            "SELECT name, version FROM dependencies WHERE repo = ? LIMIT 500",
+            (repo,),
+        ).fetchall()
+        kg.close()
+        return {r["name"]: r["version"] for r in rows if r["version"]}
+    except Exception:
+        return {}
+
+
+# ─── v3 Layer 3: dynamic confirmation ──────────────────────────────────────
+
+def _tool_sanitizer_build(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    sanitizers = args.get("sanitizers", "asan,ubsan")
+    timeout = int(args.get("timeout_seconds", 1800))
+
+    # Memoize: if we already built this repo at this git_sha, return cached
+    try:
+        from lacuna.kg import open_kg
+        kg = open_kg()
+        git_sha = _git_sha(root)
+        if git_sha:
+            cached = kg.latest_sanitizer_build(repo, git_sha, sanitizers)
+            if cached and cached.get("status") == "success":
+                kg.close()
+                return _ok({
+                    "summary": f"sanitizer_build cached: {cached['status']}",
+                    "cached": True,
+                    "result": {
+                        "status": cached["status"],
+                        "build_system": cached.get("build_system"),
+                        "binaries": json.loads(cached.get("binaries_json") or "[]"),
+                        "warnings": json.loads(cached.get("warnings_json") or "[]"),
+                        "duration_s": cached["duration_s"],
+                    },
+                })
+        kg.close()
+    except Exception:
+        git_sha = None
+
+    from lacuna.dynamic.sanitizer_build import build, to_dict
+    result = build(root, sanitizers=sanitizers, timeout_seconds=timeout)
+
+    # Persist
+    if git_sha:
+        try:
+            kg = open_kg()
+            kg.record_sanitizer_build(
+                repo=repo, git_sha=git_sha, sanitizers=sanitizers,
+                build_system=result.build_system,
+                status=result.status,
+                build_log_path=result.build_log_path,
+                binaries=result.binaries,
+                warnings=result.warnings,
+                duration_s=result.duration_s,
+            )
+            kg.close()
+        except Exception:
+            pass
+
+    return _ok({
+        "summary": (
+            f"sanitizer_build: {result.status} "
+            f"({result.build_system or 'unknown'}, {result.duration_s}s)"
+        ),
+        "cached": False,
+        "result": to_dict(result),
+    })
+
+
+def _git_sha(repo_root: Path) -> str | None:
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if p.returncode == 0:
+            return p.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+# ─── v3 Layer 4: patches ───────────────────────────────────────────────────
+
+def _tool_patch_essence(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    commit_sha = args["commit_sha"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    from lacuna.patches import extract_essence
+    essence = extract_essence(commit_sha=commit_sha, repo_root=root)
+    if not essence:
+        return _err(f"could not extract essence for {commit_sha}")
+
+    # Persist the rule
+    pr_id = None
+    try:
+        from lacuna.kg import open_kg
+        kg = open_kg()
+        pr_id = kg.add_patch_rule(
+            source_kind="internal_commit",
+            source_ref=commit_sha,
+            repo=repo,
+            bug_class=essence.bug_class,
+            rule_yaml=essence.rule_yaml,
+            before_pattern=essence.before_pattern,
+            after_pattern=essence.after_pattern,
+            essence_md=essence.essence_md,
+            confidence=essence.confidence,
+        )
+        kg.close()
+    except Exception:
+        pass
+
+    return _ok({
+        "summary": (
+            f"patch_essence: {essence.bug_class or 'unclassified'} "
+            f"({essence.confidence:.2f} confidence) — "
+            f"{len(essence.files_changed)} files"
+        ),
+        "rule_id": pr_id,
+        "bug_class": essence.bug_class,
+        "files_changed": essence.files_changed,
+        "before_pattern": essence.before_pattern,
+        "after_pattern": essence.after_pattern,
+        "essence_md": essence.essence_md,
+        "rule_yaml": essence.rule_yaml,
+        "confidence": essence.confidence,
+    })
+
+
+def _tool_propagate_pattern(args: dict) -> list[TextContent]:
+    repo = args["repo"]
+    root = _resolve_repo_root(repo)
+    if not root:
+        return _err(f"unknown repo: {repo}")
+    rule_yaml = args.get("rule_yaml", "")
+    rule_id = args.get("rule_id")
+
+    # If rule_id provided, fetch from KG
+    if rule_id and not rule_yaml:
+        try:
+            from lacuna.kg import open_kg
+            kg = open_kg()
+            row = kg.get_patch_rule(rule_id)
+            kg.close()
+            if not row:
+                return _err(f"unknown rule_id: {rule_id}")
+            rule_yaml = row["rule_yaml"]
+        except Exception as e:
+            return _err(f"failed to load rule: {e}")
+
+    if not rule_yaml:
+        return _err("provide either rule_yaml or rule_id")
+
+    from lacuna.patches import propagate_pattern
+    result = propagate_pattern(root, rule_yaml)
+    return _ok({
+        "summary": result["summary"],
+        "match_count": len(result["matches"]),
+        "matches": result["matches"][:50],
     })
 
 

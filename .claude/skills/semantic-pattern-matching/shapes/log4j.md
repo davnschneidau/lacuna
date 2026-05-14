@@ -29,4 +29,4 @@ What this usually looks like in code:
 
 ## Calibration
 
-Specific to Java stacks with the vulnerable Log4j range. Check dependency_graph for log4j-core 2.0-2.16.
+Specific to Java stacks with the vulnerable Log4j range. Check dependency_graph for log4j-core 2.0–2.16.

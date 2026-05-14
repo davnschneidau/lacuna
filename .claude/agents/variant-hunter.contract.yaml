@@ -1,0 +1,12 @@
+name: variant-hunter
+input_caps:
+  max_input_tokens: 12000
+  must_include_in_context:
+    - "/memory/application_model.md"
+  must_not_include_in_context:
+    - "/memory/refuted_hypotheses/"
+output_caps:
+  max_output_tokens: 6000
+expected_outputs:
+  - "1 to 30 kg.write.hypothesis calls each paired with kg.write.variant_link, OR"
+  - "A kg.write.event with event_type=variant_hunter_no_siblings"

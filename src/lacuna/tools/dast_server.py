@@ -382,6 +382,63 @@ async def list_tools() -> list[Tool]:
             },
             "required": ["exploit"],
         }),
+
+        # ─── v3 Layer 3: dynamic confirmation oracles ─────────────────────
+        Tool(name="fuzz_function", description=(
+            "Fuzz a specific function using libFuzzer. Generates a harness, "
+            "compiles it against the (sanitizer-built) library, runs for "
+            "`timeout_seconds`, returns crashes with ASan reports and "
+            "minimized inputs. Requires prior successful sanitizer_build "
+            "for the target repo. The strongest possible confirmation "
+            "oracle for memory-safety hypotheses."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string"},
+                "function_name": {"type": "string"},
+                "signature": {"type": "string"},
+                "library_path": {"type": "string"},
+                "timeout_seconds": {"type": "integer", "default": 300},
+                "max_total_runs": {"type": "integer"},
+                "triggered_by": {"type": "string"},
+            },
+            "required": ["repo", "function_name", "signature",
+                          "library_path"],
+        }),
+
+        Tool(name="symex_reach", description=(
+            "Use angr symbolic execution to find a concrete input that "
+            "drives execution from `source` to `target` in a binary. "
+            "Returns either {reachable: true, concrete_input_b64} or "
+            "{reachable: false}. Used when fuzzing fails to hit a path "
+            "gated by deep conditional chains."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "binary_path": {"type": "string"},
+                "source": {"type": "string"},
+                "target": {"type": "string"},
+                "timeout_seconds": {"type": "integer", "default": 60},
+            },
+            "required": ["binary_path", "source", "target"],
+        }),
+
+        Tool(name="differential_parse", description=(
+            "Run the same input through multiple parser implementations "
+            "(HTTP, URL, JSON) and report divergence. Catches request "
+            "smuggling, SSRF parser confusion, JSON key-confusion shapes. "
+            "Strongest evidence type for parser-discrepancy vulns."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "protocol": {"type": "string",
+                              "enum": ["http_request", "url", "json"]},
+                "input_bytes_hex": {"type": "string"},
+                "parsers": {"type": "array",
+                             "items": {"type": "string"}},
+            },
+            "required": ["protocol", "input_bytes_hex"],
+        }),
     ]
 
 
@@ -414,6 +471,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _t_oracle_ysoserial(arguments)
         if name == "oracle_gopherus":
             return _t_oracle_gopherus(arguments)
+        # ─── v3 Layer 3 ──
+        if name == "fuzz_function":
+            return _t_fuzz_function(arguments)
+        if name == "symex_reach":
+            return _t_symex_reach(arguments)
+        if name == "differential_parse":
+            return _t_differential_parse(arguments)
     except Exception as e:
         return _err(f"DAST tool '{name}' raised: {e}")
     return _err(f"unknown DAST tool: {name}")
@@ -891,6 +955,145 @@ def _t_oracle_gopherus(args: dict) -> list[TextContent]:
         exploit=args["exploit"],
         command=args.get("command"),
     ))
+
+
+# ─── v3 Layer 3 dynamic-confirmation oracles ───────────────────────────────
+
+def _t_fuzz_function(args: dict) -> list[TextContent]:
+    """Fuzz a function, record results to KG."""
+    from pathlib import Path
+    import time
+    from lacuna.dynamic.fuzzer import fuzz_function, to_dict
+
+    workspace = Path(os.environ.get(
+        "LACUNA_FUZZ_WORKSPACE", "/state/fuzz",
+    ))
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    repo = args["repo"]
+    function_name = args["function_name"]
+    signature = args["signature"]
+    library_path = args["library_path"]
+    timeout = int(args.get("timeout_seconds", 300))
+    triggered_by = args.get("triggered_by")
+    max_runs = args.get("max_total_runs")
+
+    if not Path(library_path).exists():
+        return _err(f"library_path does not exist: {library_path}")
+
+    result = fuzz_function(
+        repo=repo,
+        function_name=function_name,
+        signature=signature,
+        library_path=library_path,
+        timeout_seconds=timeout,
+        workspace=workspace,
+        max_total_runs=max_runs,
+    )
+
+    # Persist to KG
+    fuzz_run_id = None
+    try:
+        from lacuna.kg import open_kg
+        kg = open_kg()
+        fuzz_run_id = kg.record_fuzz_run(
+            repo=repo,
+            function_qual=function_name,
+            binary_path=library_path,
+            timeout_s=timeout,
+            executions=result.executions,
+            coverage_pct=result.coverage_pct,
+            status=result.status,
+            triggered_by=triggered_by,
+            duration_s=result.duration_s,
+        )
+        for crash in result.crashes:
+            kg.record_fuzz_crash(
+                fuzz_run_id=fuzz_run_id,
+                asan_kind=crash.get("asan_kind"),
+                crash_stack=crash.get("crash_stack", []),
+                input_path=crash["input_path"],
+                minimized_input_path=crash.get("minimized_input_path"),
+                asan_log_path=crash.get("asan_log_path"),
+            )
+        kg.close()
+    except Exception:
+        pass
+
+    return _ok({
+        "summary": (
+            f"fuzz_function {function_name}: {result.status}, "
+            f"{len(result.crashes)} crash(es) in {result.duration_s}s"
+        ),
+        "fuzz_run_id": fuzz_run_id,
+        "status": result.status,
+        "executions": result.executions,
+        "crashes": result.crashes,
+        "duration_s": result.duration_s,
+        "error_message": result.error_message,
+    })
+
+
+def _t_symex_reach(args: dict) -> list[TextContent]:
+    """Run angr symex to find a witness input from source to target."""
+    from lacuna.dynamic.symex import symex_reach, to_dict
+    result = symex_reach(
+        binary_path=args["binary_path"],
+        source=args["source"],
+        target=args["target"],
+        timeout_seconds=int(args.get("timeout_seconds", 60)),
+    )
+    return _ok({
+        "summary": (
+            f"symex_reach: "
+            f"{'reachable' if result.reachable else 'not reached'} "
+            f"({result.explored_states} states, {result.duration_s}s)"
+        ),
+        **to_dict(result),
+    })
+
+
+def _t_differential_parse(args: dict) -> list[TextContent]:
+    """Multi-parser differential testing."""
+    import binascii
+    from lacuna.dynamic.differential import differential_parse, to_dict
+    try:
+        input_bytes = binascii.unhexlify(args["input_bytes_hex"])
+    except (binascii.Error, ValueError) as e:
+        return _err(f"bad input_bytes_hex: {e}")
+    result = differential_parse(
+        protocol=args["protocol"],
+        input_bytes=input_bytes,
+        parsers=args.get("parsers"),
+    )
+    # Persist if divergence found
+    if result.divergence:
+        try:
+            from lacuna.kg import open_kg
+            kg = open_kg()
+            kg.add_differential_finding(
+                protocol=result.protocol,
+                input_hex=args["input_bytes_hex"],
+                parser_results={
+                    n: {"ok": pr.ok, "parsed": pr.parsed, "error": pr.error}
+                    for n, pr in result.parser_results.items()
+                },
+                divergence=result.divergence,
+                exploit_class=result.exploit_class,
+            )
+            kg.close()
+        except Exception:
+            pass
+
+    return _ok({
+        "summary": (
+            f"differential_parse {args['protocol']}: "
+            f"{'DIVERGENT' if result.divergence else 'consistent'}"
+            + (f" → {result.exploit_class}"
+               if result.exploit_class else "")
+        ),
+        **to_dict(result),
+    })
 
 
 # ── entrypoint ──────────────────────────────────────────────────────────────

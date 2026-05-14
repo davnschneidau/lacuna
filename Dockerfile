@@ -26,6 +26,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-dev \
         python3-pip \
         python3-venv \
+        clang \
+        clang-tools \
+        llvm \
+        libfuzzer-14-dev \
+        cmake \
+        autoconf \
+        automake \
+        libtool \
+        ninja-build \
+        meson \
+        gdb \
     && rm -rf /var/lib/apt/lists/*
 
 ###############################################################################
@@ -93,7 +104,7 @@ COPY bitbucket-pipe/pipe.sh /opt/lacuna/pipe.sh
 RUN chmod +x /opt/lacuna/pipe.sh
 
 # Lacuna's runtime state (ephemeral, fresh per scan)
-RUN mkdir -p /state /workspace /reports
+RUN mkdir -p /state /workspace /reports /state/fuzz /state/sanitizer-builds
 
 ENV LACUNA_KG_PATH=/state/lacuna.db \
     LACUNA_EVIDENCE_DIR=/state/evidence \
@@ -108,6 +119,12 @@ ENV LACUNA_KG_PATH=/state/lacuna.db \
     LACUNA_WALL_CLOCK_HOURS=4 \
     LACUNA_BUDGET_USD=50 \
     LACUNA_MAX_PARALLEL_SUBAGENTS=8 \
+    LACUNA_FUZZ_BUDGET_MINUTES=60 \
+    LACUNA_FUZZ_WORKSPACE=/state/fuzz \
+    LACUNA_SANITIZER_BUILD_DIR=/state/sanitizer-builds \
+    LACUNA_SYMEX_TIMEOUT_S=60 \
+    CC=clang \
+    CXX=clang++ \
     YSOSERIAL_JAR=/opt/ysoserial-all.jar \
     GOPHERUS_BIN=gopherus
 

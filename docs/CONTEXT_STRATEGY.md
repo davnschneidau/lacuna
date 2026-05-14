@@ -40,16 +40,16 @@ durable │  ephemeral   │  ████  Tier 3: Working scratch (current tur
 Each tier has explicit rules.
 
 ### Tier 1 — System prompt + active skills
-The orchestrator's CLAUDE.md plus whatever skills are auto-invoked. Budget: **~4-8K tokens**. Never grows during the scan. Lives at the top of context across compactions.
+The orchestrator's CLAUDE.md plus whatever skills are auto-invoked. Budget: **~4–8K tokens**. Never grows during the scan. Lives at the top of context across compactions.
 
 ### Tier 2 — Just-in-time references
-Handles to durable state: KG status summary, manifest path, current phase, list of pending hypothesis IDs (not their content). Budget: **~2-4K tokens**. Refreshed at every turn via the `SessionStart` and `UserPromptSubmit` hooks.
+Handles to durable state: KG status summary, manifest path, current phase, list of pending hypothesis IDs (not their content). Budget: **~2–4K tokens**. Refreshed at every turn via the `SessionStart` and `UserPromptSubmit` hooks.
 
 ### Tier 3 — Working scratch
 The current reasoning chain, current tool calls, intermediate decisions. Budget: **whatever's left until compaction trigger**. Expected to be lost — the agent commits anything important to the KG before it can be compacted away.
 
 ### Tier 4 — Subagent isolation
-A subagent has its own Tier 1-3. The orchestrator never sees its working scratch — only the explicit summary the subagent writes. Anthropic's documented pattern: subagents can burn tens of thousands of tokens internally, return ~1-2K tokens. Lacuna's hunter and validator agents follow this contract precisely.
+A subagent has its own Tier 1–3. The orchestrator never sees its working scratch — only the explicit summary the subagent writes. Anthropic's documented pattern: subagents can burn tens of thousands of tokens internally, return ~1–2K tokens. Lacuna's hunter and validator agents follow this contract precisely.
 
 ### Tier 5 — Knowledge graph + event log
 Durable. Lives in SQLite at `/state/lacuna.db`. *This is the agent's memory.* Compaction summaries are lossy; the KG is not. After every compaction, the orchestrator re-reads from the KG, not from the summary.
@@ -644,7 +644,7 @@ The hypothesis is now: a confirmed finding (`fnd-...`), a primitive (`prim-...`)
 
 The `report-tech` skill picks up the finding with its evidence path, the primitive with its prerequisites, and the chain with its step-by-step narrative.
 
-**Total context cost to the orchestrator across this lifecycle:** roughly 3K tokens (hunter summary 1.5K + validator summary 1.2K + chain notification 300). Total tokens *generated* across the lifecycle by all agents: probably 80-120K. The ratio — generated to retained — is the entire point of the architecture.
+**Total context cost to the orchestrator across this lifecycle:** roughly 3K tokens (hunter summary 1.5K + validator summary 1.2K + chain notification 300). Total tokens *generated* across the lifecycle by all agents: probably 80–120K. The ratio — generated to retained — is the entire point of the architecture.
 
 ---
 

@@ -2,13 +2,23 @@
 
 > Agentic, multi-repo, application-level security scanner. Mythos-style behavior on top of Claude Code. SAST and DAST in one box. Runs as a Docker container — Bitbucket Cloud pipe or ad-hoc.
 
-**v2.0.0** — 
-v2 adds a from-scratch inter-procedural taint engine, git-history-as-evidence,
-known-gadget catalog, deep oracles (sqlmap/ysoserial/gopherus), headless
-Playwright DAST, state-machine extraction, custom semgrep per scan,
-test-coverage-as-oracle, parallel hunters/validators, speculative re-open,
-adversarial skeptic pass, trust-shadow capability mapping, minimal-repro
-enforcement, and coverage-aware reporting.
+**v3.0.0** — CVE-grade vulnerability discovery. v3 adds precision static
+analysis (integer overflow / use-after-free / format string / type
+confusion), dynamic confirmation oracles (sanitizer builds, libFuzzer,
+angr symex, parser-differential testing), patch-diff infrastructure
+(variant search from your own git history), and the researcher-mindset
+skills (`vulnerability-researcher`, `interesting-input`, `trust-the-fuzzer`,
+`read-the-fix`, `adversary-pricing`) plus three new agents
+(`patch-archaeologist`, `variant-hunter`, `fuzzing-coordinator`). See
+`CHANGELOG.md` for the full v3 entry.
+
+**v2.0.0** — added the from-scratch inter-procedural taint engine
+(CodeQL-equivalent), git-history-as-evidence, known-gadget catalog,
+deep oracles (sqlmap/ysoserial/gopherus), headless Playwright DAST,
+state-machine extraction, custom semgrep per scan, test-coverage-as-oracle,
+parallel hunters/validators, speculative re-open, adversarial skeptic
+pass, trust-shadow capability mapping, minimal-repro enforcement, and
+coverage-aware reporting.
 
 Lacuna scans **applications**, not repositories. You give it a manifest declaring the 1..N repos that compose your application and the trust boundaries between them, and it returns two reports: an executive narrative of risk and a technical catalog of findings, exploit primitives, and composed attack chains.
 
@@ -126,6 +136,18 @@ The design documents in `docs/` are the canonical source:
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — System architecture: phases, agent topology, tool catalog, knowledge graph schema, report structure.
 - [`docs/CONTEXT_STRATEGY.md`](docs/CONTEXT_STRATEGY.md) — Mythos-style context management deep-dive: compaction, context editing, memory tool, sub-agent isolation, just-in-time retrieval, the validator's red/blue dialectic, the chain-builder's pure-primitive context.
+
+### v3 capability layers
+
+v3 organizes its new capabilities into five layered modules:
+
+| Layer | Module | What it does |
+|---|---|---|
+| 2 | `src/lacuna/precision/` | Precision static analysis: `integer_range`, `lifetime` (UAF), `format_string`, `type_confusion`, `allocator_map`. Output: `precision_findings` — high-confidence leads hunters convert into hypotheses. |
+| 3 | `src/lacuna/dynamic/` | Dynamic confirmation oracles: `sanitizer_build` (ASan/UBSan), `fuzzer` (libFuzzer harness wrapper + crash minimization), `symex` (angr subprocess), `differential` (multi-parser HTTP/URL/JSON oracle for smuggling and parser-confusion CVEs). |
+| 4 | `src/lacuna/patches/` | Patch-diff and variant search: `patch_essence` extracts the bug-class abstraction from a fix commit and generates a semgrep-style propagation rule; `propagate_pattern` runs it across the codebase to find sibling vulnerable sites. |
+| 5 | `.claude/skills/` | Researcher mindset, encoded: `vulnerability-researcher`, `interesting-input`, `trust-the-fuzzer`, `read-the-fix`, `adversary-pricing`. |
+| Agents | `.claude/agents/` | Three new: `patch-archaeologist` (mines git history for incomplete fixes), `variant-hunter` (auto-spawned per confirmed finding), `fuzzing-coordinator` (decides what to fuzz under wall-clock budget). |
 
 ## Status
 

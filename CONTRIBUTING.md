@@ -1,9 +1,9 @@
 # Contributing to Lacuna
 
 Thanks for considering a contribution. This document covers the practical
-things - code style, tests, docs - but the more important thing first.
+things — code style, tests, docs — but the more important thing first.
 
-## What is wanted
+## What we want
 
 - **Bug shapes Lacuna misses.** If you find a real vulnerability that
   Lacuna didn't surface, the diagnosis is more useful than the fix. Open
@@ -54,7 +54,7 @@ returns a well-formed response shape.
 - Ruff (`ruff check .`) — config in `pyproject.toml`.
 - Type hints encouraged but not strictly required; `mypy --strict` is
   on the roadmap.
-- Caveman style in *prompts and skills*, regular prose in code
+- caveman style in *prompts and skills*, regular prose in code
   comments and docs.
 
 ## Pull request etiquette

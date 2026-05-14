@@ -794,6 +794,222 @@ class KG:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ─── v3: precision findings ─────────────────────────────────────────────
+
+    def add_precision_finding(
+        self, kind: str, repo: str, file: str, line: int,
+        function_qual: str | None, cwe: str | None,
+        detail_md: str, evidence: dict, confidence: float,
+        cve_hint: str | None = None,
+    ) -> str:
+        pf_id = f"pf-{_ulid()}"
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO precision_findings
+                   (id, kind, repo, file, line, function_qual, cwe,
+                    detail_md, evidence_json, confidence, cve_hint)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (pf_id, kind, repo, file, line, function_qual, cwe,
+                 detail_md, json.dumps(evidence), confidence, cve_hint),
+            )
+        return pf_id
+
+    def list_precision_findings(
+        self, kind: str | None = None, repo: str | None = None,
+        unconsumed_only: bool = False,
+    ) -> list[dict]:
+        q = "SELECT * FROM precision_findings WHERE 1=1"
+        args: list[Any] = []
+        if kind:
+            q += " AND kind = ?"
+            args.append(kind)
+        if repo:
+            q += " AND repo = ?"
+            args.append(repo)
+        if unconsumed_only:
+            q += " AND consumed_by_hyp IS NULL"
+        q += " ORDER BY confidence DESC"
+        return [dict(r) for r in self._conn.execute(q, args).fetchall()]
+
+    def mark_precision_finding_consumed(self, pf_id: str, hyp_id: str) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE precision_findings SET consumed_by_hyp = ? WHERE id = ?",
+                (hyp_id, pf_id),
+            )
+
+    # ─── v3: sanitizer builds ───────────────────────────────────────────────
+
+    def record_sanitizer_build(
+        self, repo: str, git_sha: str, sanitizers: str,
+        build_system: str | None, status: str,
+        build_log_path: str | None, binaries: list[dict],
+        warnings: list[dict], duration_s: int,
+    ) -> str:
+        sb_id = f"sb-{_ulid()}"
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO sanitizer_builds
+                   (id, repo, git_sha, sanitizers, build_system, status,
+                    build_log_path, binaries_json, warnings_json, duration_s)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (sb_id, repo, git_sha, sanitizers, build_system, status,
+                 build_log_path, json.dumps(binaries), json.dumps(warnings),
+                 duration_s),
+            )
+        return sb_id
+
+    def latest_sanitizer_build(
+        self, repo: str, git_sha: str, sanitizers: str = "asan,ubsan",
+    ) -> dict | None:
+        r = self._conn.execute(
+            "SELECT * FROM sanitizer_builds "
+            "WHERE repo = ? AND git_sha = ? AND sanitizers = ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (repo, git_sha, sanitizers),
+        ).fetchone()
+        return dict(r) if r else None
+
+    # ─── v3: fuzz runs and crashes ──────────────────────────────────────────
+
+    def record_fuzz_run(
+        self, repo: str, function_qual: str, binary_path: str,
+        timeout_s: int, executions: int | None, coverage_pct: float | None,
+        status: str, triggered_by: str | None, duration_s: int,
+    ) -> str:
+        fr_id = f"fr-{_ulid()}"
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO fuzz_runs
+                   (id, repo, function_qual, binary_path, timeout_s,
+                    executions, coverage_pct, status, triggered_by, duration_s)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (fr_id, repo, function_qual, binary_path, timeout_s,
+                 executions, coverage_pct, status, triggered_by, duration_s),
+            )
+        return fr_id
+
+    def record_fuzz_crash(
+        self, fuzz_run_id: str, asan_kind: str | None,
+        crash_stack: list[str], input_path: str,
+        minimized_input_path: str | None, asan_log_path: str | None,
+    ) -> str:
+        c_id = f"fc-{_ulid()}"
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO fuzz_crashes
+                   (id, fuzz_run_id, asan_kind, crash_stack_json,
+                    input_path, minimized_input_path, asan_log_path)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (c_id, fuzz_run_id, asan_kind, json.dumps(crash_stack),
+                 input_path, minimized_input_path, asan_log_path),
+            )
+        return c_id
+
+    def list_fuzz_crashes(self, fuzz_run_id: str | None = None) -> list[dict]:
+        if fuzz_run_id:
+            rows = self._conn.execute(
+                "SELECT * FROM fuzz_crashes WHERE fuzz_run_id = ?",
+                (fuzz_run_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM fuzz_crashes ORDER BY discovered_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_fuzz_runs_for_function(
+        self, repo: str, function_qual: str,
+    ) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM fuzz_runs WHERE repo = ? AND function_qual = ? "
+            "ORDER BY started_at DESC",
+            (repo, function_qual),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ─── v3: patch rules ────────────────────────────────────────────────────
+
+    def add_patch_rule(
+        self, source_kind: str, source_ref: str, repo: str | None,
+        bug_class: str | None, rule_yaml: str,
+        before_pattern: str | None, after_pattern: str | None,
+        essence_md: str | None, confidence: float,
+    ) -> str:
+        pr_id = f"pr-{_ulid()}"
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO patch_rules
+                   (id, source_kind, source_ref, repo, bug_class,
+                    rule_yaml, before_pattern, after_pattern,
+                    essence_md, confidence)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (pr_id, source_kind, source_ref, repo, bug_class,
+                 rule_yaml, before_pattern, after_pattern,
+                 essence_md, confidence),
+            )
+        return pr_id
+
+    def list_patch_rules(
+        self, source_kind: str | None = None, repo: str | None = None,
+    ) -> list[dict]:
+        q = "SELECT * FROM patch_rules WHERE 1=1"
+        args: list[Any] = []
+        if source_kind:
+            q += " AND source_kind = ?"
+            args.append(source_kind)
+        if repo:
+            q += " AND repo = ?"
+            args.append(repo)
+        q += " ORDER BY confidence DESC"
+        return [dict(r) for r in self._conn.execute(q, args).fetchall()]
+
+    def get_patch_rule(self, pr_id: str) -> dict | None:
+        r = self._conn.execute(
+            "SELECT * FROM patch_rules WHERE id = ?", (pr_id,),
+        ).fetchone()
+        return dict(r) if r else None
+
+    # ─── v3: variant links ──────────────────────────────────────────────────
+
+    def add_variant_link(
+        self, child_hyp_id: str, parent_finding_id: str,
+        propagation_rule_id: str | None = None,
+    ) -> None:
+        with self.tx() as c:
+            c.execute(
+                """INSERT OR REPLACE INTO variant_links
+                   (child_hyp_id, parent_finding_id, propagation_rule_id)
+                   VALUES (?,?,?)""",
+                (child_hyp_id, parent_finding_id, propagation_rule_id),
+            )
+
+    def list_variants_of(self, parent_finding_id: str) -> list[dict]:
+        return [
+            dict(r) for r in self._conn.execute(
+                "SELECT * FROM variant_links WHERE parent_finding_id = ?",
+                (parent_finding_id,),
+            ).fetchall()
+        ]
+
+    # ─── v3: differential findings ──────────────────────────────────────────
+
+    def add_differential_finding(
+        self, protocol: str, input_hex: str, parser_results: dict,
+        divergence: bool, exploit_class: str | None,
+    ) -> str:
+        df_id = f"df-{_ulid()}"
+        with self.tx() as c:
+            c.execute(
+                """INSERT INTO differential_findings
+                   (id, protocol, input_hex, parser_results_json,
+                    divergence, exploit_class)
+                   VALUES (?,?,?,?,?,?)""",
+                (df_id, protocol, input_hex, json.dumps(parser_results),
+                 1 if divergence else 0, exploit_class),
+            )
+        return df_id
+
 
 def open_kg(path: str | Path | None = None) -> KG:
     """Open the KG at the path given by LACUNA_KG_PATH (default), or override."""

@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-LACUNA_VERSION="2.0.0"
+LACUNA_VERSION="1.0.0"
 LACUNA_HOME="${LACUNA_HOME:-/opt/lacuna}"
 LACUNA_CLAUDE_HOME="${LACUNA_CLAUDE_HOME:-/opt/lacuna/.claude}"
 LACUNA_STATE_DIR="${LACUNA_STATE_DIR:-/state}"

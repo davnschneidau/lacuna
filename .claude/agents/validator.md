@@ -28,12 +28,21 @@ tools:
   - mcp__lacuna-recon__authz_checks
   - mcp__lacuna-recon__service_map
   - mcp__lacuna-recon__db_schema
+  - mcp__lacuna-kg__kg.read.precision_findings
+  - mcp__lacuna-kg__kg.read.fuzz_runs
+  - mcp__lacuna-kg__kg.read.fuzz_crashes
+  - mcp__lacuna-kg__kg.read.patch_rules
+  - mcp__lacuna-kg__kg.read.variant_links
   - mcp__lacuna-dast__*
 skills:
   - caveman
   - red-blue-dialectic
   - primitive-extraction
   - poc-drafting
+  - vulnerability-researcher
+  - trust-the-fuzzer
+  - interesting-input
+  - adversary-pricing
 ---
 
 # Validator

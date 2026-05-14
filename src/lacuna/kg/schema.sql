@@ -321,3 +321,115 @@ CREATE TABLE IF NOT EXISTS flow_paths (
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_flow_kinds ON flow_paths(source_kind, sink_kind);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- v3 — Precision static analysis findings
+-- Output from Layer 2 tools (integer range, UAF, format string, type confusion).
+-- NOT hypotheses; high-quality leads that hunters convert into hypotheses.
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS precision_findings (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL,      -- int_overflow|uaf|double_free|fmt_string|type_confusion
+    repo            TEXT NOT NULL,
+    file            TEXT NOT NULL,
+    line            INTEGER NOT NULL,
+    function_qual   TEXT,
+    cwe             TEXT,
+    detail_md       TEXT NOT NULL,
+    evidence_json   TEXT,               -- structured analysis output
+    confidence      REAL NOT NULL,
+    cve_hint        TEXT,               -- forward-compat with Layer 1
+    consumed_by_hyp TEXT,               -- hypothesis ID that uses this
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pf_kind ON precision_findings(kind);
+CREATE INDEX IF NOT EXISTS idx_pf_repo ON precision_findings(repo);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- v3 — Sanitizer build records
+-- Memoizes expensive build attempts. Re-used by fuzzer + tests.
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS sanitizer_builds (
+    id              TEXT PRIMARY KEY,
+    repo            TEXT NOT NULL,
+    git_sha         TEXT NOT NULL,
+    sanitizers      TEXT NOT NULL,      -- e.g. "asan,ubsan"
+    build_system    TEXT,               -- cmake|make|cargo|...
+    status          TEXT NOT NULL,      -- success|failed|timeout
+    build_log_path  TEXT,
+    binaries_json   TEXT,               -- list of {name, path, kind}
+    warnings_json   TEXT,               -- list of sanitizer warnings caught at build
+    started_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    duration_s      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sb_repo ON sanitizer_builds(repo, git_sha);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- v3 — Fuzz runs
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS fuzz_runs (
+    id              TEXT PRIMARY KEY,
+    repo            TEXT NOT NULL,
+    function_qual   TEXT NOT NULL,
+    binary_path     TEXT NOT NULL,
+    timeout_s       INTEGER NOT NULL,
+    executions      INTEGER,
+    coverage_pct    REAL,
+    status          TEXT NOT NULL,      -- completed|timeout|build_failed|crashed
+    triggered_by    TEXT,               -- hypothesis_id or "precision"
+    started_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    duration_s      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS fuzz_crashes (
+    id              TEXT PRIMARY KEY,
+    fuzz_run_id     TEXT NOT NULL REFERENCES fuzz_runs(id),
+    asan_kind       TEXT,               -- heap-buffer-overflow|use-after-free|null-deref|...
+    crash_stack_json TEXT,
+    input_path      TEXT NOT NULL,
+    minimized_input_path TEXT,
+    asan_log_path   TEXT,
+    discovered_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- v3 — Patch-derived rules
+-- The output of patch_essence: a semgrep-style rule extracted from a fix
+-- commit. Used by propagate_pattern to find variants.
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS patch_rules (
+    id              TEXT PRIMARY KEY,
+    source_kind     TEXT NOT NULL,      -- internal_commit|cve|finding
+    source_ref      TEXT NOT NULL,      -- commit_sha|cve_id|finding_id
+    repo            TEXT,
+    bug_class       TEXT,               -- CWE id
+    rule_yaml       TEXT NOT NULL,      -- semgrep rule
+    before_pattern  TEXT,
+    after_pattern   TEXT,
+    essence_md      TEXT,
+    confidence      REAL NOT NULL,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- v3 — Variant findings: hypotheses spawned from a parent finding
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS variant_links (
+    child_hyp_id    TEXT PRIMARY KEY,
+    parent_finding_id TEXT NOT NULL,
+    propagation_rule_id TEXT REFERENCES patch_rules(id),
+    discovered_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- v3 — Differential parse results
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS differential_findings (
+    id              TEXT PRIMARY KEY,
+    protocol        TEXT NOT NULL,
+    input_hex       TEXT NOT NULL,
+    parser_results_json TEXT NOT NULL,
+    divergence      INTEGER NOT NULL,   -- bool
+    exploit_class   TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

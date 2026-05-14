@@ -28,6 +28,8 @@ tools:
   - mcp__lacuna-recon__recent_security_commits
   - mcp__lacuna-recon__removed_code_in_last_n_days
   - mcp__lacuna-recon__custom_semgrep_scan
+  - mcp__lacuna-recon__type_confusion_sites
+  - mcp__lacuna-kg__kg.read.precision_findings
   - mcp__lacuna-recon__test_coverage_for_endpoint
   - mcp__lacuna-recon__test_assertions_for_function
   - mcp__lacuna-recon__untested_handlers

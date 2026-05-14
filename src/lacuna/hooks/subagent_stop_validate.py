@@ -110,15 +110,71 @@ def _check_skeptic(kg) -> str | None:
 
 
 def _check_orchestrator_global(kg) -> str | None:
-    """End-of-scan global gates: all findings need minimal repros, and
-    skeptic must have reviewed everything ≥ medium.
-    """
+    """End-of-scan global gates."""
+    # 1. All confirmed findings need minimal_repros
     lacking = kg.findings_lacking_minimal_repros()
     if lacking:
         return (
             f"Cannot terminate: {len(lacking)} findings lack a minimal_repro. "
             f"First five: {lacking[:5]}"
         )
+
+    # 2. v3 gate: no in-flight fuzz_runs with status=running
+    try:
+        in_flight = kg._conn.execute(
+            "SELECT id FROM fuzz_runs WHERE status = 'running' LIMIT 5",
+        ).fetchall()
+        if in_flight:
+            ids = [r["id"] for r in in_flight]
+            return (
+                f"Cannot terminate: {len(in_flight)} fuzz runs still in "
+                f"flight (e.g. {ids}). Wait for fuzzing-coordinator to "
+                f"finalize them."
+            )
+    except Exception:
+        pass
+
+    # 3. v3 gate: no unreviewed high-severity precision_findings
+    # An "unreviewed" precision finding is one that no hunter has consumed
+    # AND no validator has converted to a hypothesis. High-severity =
+    # CWE-190/416/415/787/843 (memory/integer/type-confusion classes).
+    try:
+        unreviewed_high = kg._conn.execute(
+            "SELECT id, cwe FROM precision_findings "
+            "WHERE consumed_by_hyp IS NULL "
+            "AND confidence >= 0.7 "
+            "AND cwe IN ('CWE-190','CWE-416','CWE-415','CWE-787','CWE-843',"
+            "            'CWE-122','CWE-125','CWE-369')",
+        ).fetchall()
+        if unreviewed_high:
+            ids = [r["id"] for r in unreviewed_high[:5]]
+            return (
+                f"Cannot terminate: {len(unreviewed_high)} high-severity "
+                f"precision findings unreviewed (no hunter consumed them). "
+                f"Spawn a hunter for the relevant repos or write an "
+                f"explicit observation explaining why each can be skipped. "
+                f"First five: {ids}"
+            )
+    except Exception:
+        pass
+
+    # 4. v3 gate: every variant_link's child hypothesis must have a verdict
+    try:
+        unresolved_variants = kg._conn.execute(
+            "SELECT vl.child_hyp_id FROM variant_links vl "
+            "JOIN hypotheses h ON h.id = vl.child_hyp_id "
+            "WHERE h.status NOT IN ('confirmed','refuted','needs_human') "
+            "LIMIT 5",
+        ).fetchall()
+        if unresolved_variants:
+            ids = [r["child_hyp_id"] for r in unresolved_variants]
+            return (
+                f"Cannot terminate: variant hypotheses still under review. "
+                f"First five: {ids}"
+            )
+    except Exception:
+        pass
+
     return _check_skeptic(kg)
 
 
@@ -152,6 +208,13 @@ def main() -> int:
         elif agent == "skeptic":
             # Skeptic always allowed to stop — its work is per-finding;
             # the global orchestrator check enforces complete coverage.
+            block_reason = None
+        elif agent in ("patch-archaeologist", "variant-hunter",
+                         "fuzzing-coordinator"):
+            # These agents are "fire and forget" — they either find variants
+            # or write an explicit "nothing found" event. Either is OK to
+            # stop on. The global orchestrator check enforces that any
+            # hypotheses they wrote get validated.
             block_reason = None
         elif agent in ("orchestrator", "main", "claude"):
             # The top-level orchestrator. Apply the final global gates.

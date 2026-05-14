@@ -1,0 +1,11 @@
+name: fuzzing-coordinator
+input_caps:
+  max_input_tokens: 14000
+  must_include_in_context:
+    - "/memory/application_model.md"
+    - "/memory/current_phase.md"
+output_caps:
+  max_output_tokens: 5000
+expected_outputs:
+  - "kg.write.attach_evidence calls for each crash that confirms a hypothesis, AND"
+  - "A summary kg.write.event with event_type=fuzzing_coordinator_summary"

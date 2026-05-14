@@ -1,5 +1,5 @@
 name: Lacuna Security Scanner
-image: lacuna:2.0.0
+image: lacuna:1.0.0
 description: Agentic, application-level security scanner. SAST and DAST for multi-repo applications, powered by Claude Code through Azure Foundry.
 repository: https://your-bitbucket-workspace/lacuna
 maintainer: security@your-org.example
