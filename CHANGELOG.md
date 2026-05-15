@@ -1,5 +1,33 @@
 # Lacuna Changelog
 
+## 3.1.0 — 2026-05-15
+
+### Multi-model tiering
+
+Agent model assignments rebalanced for 3-4× cost reduction with negligible
+quality loss:
+
+- **Opus**: orchestrator, trust-shadow-analyzer, chain-builder, validator,
+  hunter-authn-authz, hunter-business-logic, hunter-cross-service,
+  hunter-deserialization, hunter-race-toctou, hunter-memory (promoted from Sonnet).
+- **Sonnet** (updated to `claude-sonnet-4-6`): recon, hunter-injection
+  (demoted from Opus), hunter-crypto (demoted from Opus), variant-hunter,
+  patch-archaeologist, fuzzing-coordinator.
+- **Haiku**: skeptic, triage-classifier (unchanged).
+
+Orchestrator now uses Sonnet validators for low-confidence hypotheses
+(`confidence < 0.5` or clear-cut shapes) — documented in `CLAUDE.md`.
+
+Target spend profile: ~15% Haiku + 45% Sonnet + 40% Opus.
+
+New environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LACUNA_MODEL_SONNET` | `claude-sonnet-4-6` | Updated from `claude-sonnet-4-5` |
+
+---
+
 ## 3.0.0 — 2026-05-14
 
 Initial public release. Lacuna is an agentic, multi-repo, application-level
@@ -108,7 +136,7 @@ are not separately versioned.
 | `LACUNA_MANIFEST` | `app.lacuna.yaml` | Manifest path |
 | `LACUNA_FAIL_ON` | `critical` | Gate severity |
 | `LACUNA_MODEL_OPUS` | `claude-opus-4-7` | Foundry deployment |
-| `LACUNA_MODEL_SONNET` | `claude-sonnet-4-5` | Foundry deployment |
+| `LACUNA_MODEL_SONNET` | `claude-sonnet-4-6` | Foundry deployment |
 | `LACUNA_MODEL_HAIKU` | `claude-haiku-4-5` | Foundry deployment |
 | `LACUNA_WALL_CLOCK_HOURS` | `4` | Hard cap per scan |
 | `LACUNA_BUDGET_USD` | unset | Soft USD cap |

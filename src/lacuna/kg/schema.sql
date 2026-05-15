@@ -470,3 +470,44 @@ CREATE TABLE IF NOT EXISTS hook_tool_calls (
     tool            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_hook_calls_agent_ts ON hook_tool_calls(agent, ts);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- Risk timeline — one row per scan, captures the delta of findings vs the
+-- previous scan. Enables "what changed since last time?" queries and
+-- CI gate trending (is risk going up or down?).
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS scan_runs (
+    id              TEXT PRIMARY KEY,            -- UUID for this scan
+    started_at      TIMESTAMP NOT NULL,
+    finished_at     TIMESTAMP,
+    mode            TEXT NOT NULL DEFAULT 'sast', -- sast | sast+dast | diff
+    manifest_path   TEXT,
+    diff_base       TEXT,
+    diff_head       TEXT,
+    finding_count   INTEGER DEFAULT 0,
+    critical_count  INTEGER DEFAULT 0,
+    high_count      INTEGER DEFAULT 0,
+    medium_count    INTEGER DEFAULT 0,
+    low_count       INTEGER DEFAULT 0,
+    chain_count     INTEGER DEFAULT 0,
+    new_finding_ids TEXT,    -- JSON array of finding IDs introduced vs prev
+    fixed_finding_ids TEXT,  -- JSON array of finding IDs resolved vs prev
+    notes           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
+
+-- ───────────────────────────────────────────────────────────────────────────
+-- Finding stability — tracks whether a finding first appeared in a prior scan
+-- (for LACUNA_MODE=diff: "was this finding already known before this PR?")
+-- ───────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS finding_provenance (
+    finding_id      TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    first_scan_id   TEXT,           -- scan_runs.id when first discovered
+    last_seen_scan_id TEXT,         -- scan_runs.id when last observed
+    status          TEXT NOT NULL CHECK (status IN
+                    ('new','persisted','fixed','regression')),
+    diff_base       TEXT,           -- git ref if discovered in diff mode
+    diff_head       TEXT,
+    PRIMARY KEY (finding_id)
+);
+CREATE INDEX IF NOT EXISTS idx_prov_status ON finding_provenance(status);

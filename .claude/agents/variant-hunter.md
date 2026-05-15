@@ -5,7 +5,7 @@ description: |
   propagation rule from the bug pattern, runs it across the codebase,
   and creates child hypotheses for sibling sites. Empirically, the
   variant multiplier on real codebases is 1.5-4×.
-model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-5}
+model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-6}
 tools:
   - mcp__lacuna-kg__kg.read.findings
   - mcp__lacuna-kg__kg.read.status
@@ -18,6 +18,14 @@ tools:
   - mcp__lacuna-recon__patch_essence
   - mcp__lacuna-recon__code_excerpt
   - mcp__lacuna-recon__ast_query
+skills:
+  - caveman
+  - semantic-pattern-matching
+  - cross-hunter-observations
+  - weird-machine
+  - primitive-extraction
+  - counterfactual-reasoning
+  - inductive-variant-hunting
 ---
 
 # Variant Hunter

@@ -2,8 +2,11 @@
 Lacuna CLI.
 
 Usage:
-    lacuna scan --manifest <path> [--workspace <path>] [--mode sast|sast+dast]
+    lacuna scan --manifest <path> [--workspace <path>]
+                 [--mode sast|sast+dast|diff]
                  [--fail-on none|critical|high|medium]
+                 [--diff-base <ref>] [--diff-head <ref>]
+                 [--diff-max-depth <n>]
     lacuna status
     lacuna report --reports-dir <path>
     lacuna version
@@ -31,17 +34,32 @@ def cli() -> None:
 @click.option("--workspace", "workspace_path", default=Path("/workspace"),
                 type=click.Path(path_type=Path))
 @click.option("--mode", "mode", default="sast",
-                type=click.Choice(["sast", "sast+dast"]))
+                type=click.Choice(["sast", "sast+dast", "diff"]))
 @click.option("--fail-on", "fail_on", default="critical",
                 type=click.Choice(["none", "critical", "high", "medium"]))
 @click.option("--wall-clock-hours", "wall_clock", type=float, default=None)
 @click.option("--max-parallel", "max_parallel", type=int, default=None)
+@click.option("--diff-base", "diff_base", default=None,
+                envvar="LACUNA_DIFF_BASE",
+                help="Git ref for diff base (required when --mode=diff)")
+@click.option("--diff-head", "diff_head", default=None,
+                envvar="LACUNA_DIFF_HEAD",
+                help="Git ref for diff head (default: HEAD)")
+@click.option("--diff-max-depth", "diff_max_depth", type=int, default=3,
+                envvar="LACUNA_DIFF_MAX_IMPORT_DEPTH",
+                help="Max transitive import hops for diff scope (default: 3)")
 def scan(
     manifest_path: Path, workspace_path: Path, mode: str, fail_on: str,
     wall_clock: float | None, max_parallel: int | None,
+    diff_base: str | None, diff_head: str | None, diff_max_depth: int,
 ) -> None:
     """Run a full scan."""
     from .harness import run_scan
+
+    if mode == "diff" and not diff_base:
+        raise click.UsageError(
+            "--mode=diff requires --diff-base (or LACUNA_DIFF_BASE env var)"
+        )
 
     wall_clock = wall_clock if wall_clock is not None else float(
         os.environ.get("LACUNA_WALL_CLOCK_HOURS", "4")
@@ -56,6 +74,9 @@ def scan(
         fail_on=fail_on,
         wall_clock_hours=wall_clock,
         max_parallel=max_parallel,
+        diff_base=diff_base,
+        diff_head=diff_head or "HEAD",
+        diff_max_depth=diff_max_depth,
     )
     sys.exit(rc)
 

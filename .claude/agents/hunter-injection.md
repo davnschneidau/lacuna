@@ -2,7 +2,7 @@
 name: hunter-injection
 description: |
   Form hypotheses about places where untrusted data reaches a sensitive sink without sufficient validation or encoding.
-model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
+model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-6}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

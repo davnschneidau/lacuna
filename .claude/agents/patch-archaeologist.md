@@ -5,7 +5,7 @@ description: |
   For each, asks: did this fix close the bug class, or just one site?
   Site-level fixes leave variants — those become hypotheses at confidence
   0.6 with the parent commit cited.
-model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-5}
+model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-6}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

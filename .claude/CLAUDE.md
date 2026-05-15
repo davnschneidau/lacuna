@@ -47,6 +47,14 @@ collects: inventory, languages, dependency graph + vulns, entrypoints, API
 surface, auth surface, authz checks, sources, sinks, secrets, IaC findings,
 git hotspots, frameworks, cross-repo calls.
 
+**New in v4 — Extended recon tools:** Also run these new tools during Phase 1:
+- `jwt_usage(repo)` — JWT decode call sites and verification bypass patterns
+- `oauth_flows(repo)` + `oauth_config_audit(repo)` — OAuth/OIDC config issues
+- `mass_assignment_surface(repo)` — ORM model binding without allowlists
+- `js_bundle_analysis(repo)` — secrets/endpoints in JS bundles
+- `ci_config_audit(repo)` — CI/CD pipeline vulnerabilities
+- `known_cve_matches(repo)` — cross-reference deps against CVE corpus
+
 After all per-repo reconnaissance returns, spawn the
 **trust-shadow-analyzer** agent (Opus). It builds the capability graph and
 records `trust_boundary_hole` observations the hunters will use.
@@ -58,8 +66,20 @@ Then call `kg.write.application_model` and set
 
 Spawn a matrix of `hunter-shape × repo` subagents concurrently. Each hunter
 operates on ONE repo at a time so they can be parallelized. The full hunter
-list (8 shapes) × N repos can be many tasks; respect
+list × N repos can be many tasks; respect
 `LACUNA_MAX_PARALLEL_SUBAGENTS` and queue the rest.
+
+**Full hunter list (12 shapes):**
+- `hunter-injection`, `hunter-crypto`, `hunter-authn-authz`, `hunter-oauth`
+- `hunter-mass-assignment`, `hunter-ssrf`, `hunter-graphql`
+- `hunter-business-logic`, `hunter-cross-service`, `hunter-deserialization`
+- `hunter-race-toctou`, `hunter-memory`, `hunter-ci-supply-chain`
+
+Specialist hunters to spawn only when relevant (detected framework/surface):
+- `hunter-oauth` → when OAuth/OIDC libraries detected in `oauth_flows(repo)`
+- `hunter-graphql` → when `/graphql` entrypoint found
+- `hunter-ci-supply-chain` → when CI configs present
+- `hunter-mass-assignment` → when ORM binding sites found in `mass_assignment_surface`
 
 **v3 addition — Layer 2 precision pre-pass.** Before the standard hunter
 matrix, run the precision tools across each repo. They produce
@@ -110,6 +130,15 @@ For each hypothesis at confidence ≥ 0.3, spawn the `validator` agent.
 **Multiple validators may run concurrently** (up to
 `LACUNA_MAX_PARALLEL_SUBAGENTS`); they operate on independent hypotheses
 and cannot interfere.
+
+**Model tiering for validators.** The validator's model field defaults to
+Opus, but you can override per-invocation when spawning subagents that
+support a `model` argument:
+- **Sonnet** for hypotheses where `confidence < 0.5` OR the shape is
+  in `{crypto-misuse, header-injection, open-redirect}` — these are
+  typically clear-cut; Sonnet handles them well.
+- **Opus** (default) for `confidence ≥ 0.5`, business-logic shapes,
+  cross-service shapes, or any hypothesis that involves chain enablement.
 
 The validator runs a red/blue dialectic (see `red-blue-dialectic` skill)
 for up to 4 rounds. On confirmation it MUST:
@@ -233,6 +262,36 @@ Cap: at most 2 re-opens per chain candidate, to bound runaway.
 | 3.6 — Variant hunter (v3) | per confirmed finding | `LACUNA_MAX_PARALLEL_SUBAGENTS / 2` |
 | 4 — Skeptic | per finding | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
 
+## Model tiering (cost/quality guide)
+
+| Agent | Model | Rationale |
+|---|---|---|
+| orchestrator | Opus | Master planner; must reason about the whole app |
+| hunter-authn-authz | Opus | Deep cross-service auth reasoning |
+| hunter-business-logic | Opus | Must infer invariants from code + schema |
+| hunter-cross-service | Opus | Multi-repo topology reasoning |
+| hunter-deserialization | Opus | High-stakes; low FP tolerance |
+| hunter-race-toctou | Opus | Subtle concurrency reasoning |
+| hunter-memory | Opus | Pointer/lifetime analysis across files |
+| validator | Opus (default) | Red/blue dialectic; must be honest |
+| chain-builder | Opus | Combinatorial primitive composition |
+| trust-shadow-analyzer | Opus | Capability graph construction |
+| hunter-injection | Sonnet | Source→sink pattern matching |
+| hunter-crypto | Sonnet | Known-misuse pattern matching |
+| hunter-oauth | Opus | Deep protocol reasoning |
+| hunter-ssrf | Opus | SSRF tier analysis + weird-machine |
+| hunter-graphql | Sonnet | Schema enumeration + auth checks |
+| hunter-mass-assignment | Sonnet | ORM binding pattern matching |
+| hunter-ci-supply-chain | Sonnet | Pipeline config analysis |
+| recon | Sonnet | Tool-heavy; structured output |
+| variant-hunter | Sonnet | Propagation rule execution |
+| patch-archaeologist | Sonnet | Git history + semgrep pattern work |
+| fuzzing-coordinator | Sonnet | Budget arithmetic + dispatch |
+| skeptic | Haiku | Re-review confirmed findings |
+| triage-classifier | Haiku | Bulk confidence adjustment |
+
+Targeted cost: ~15% Haiku + 45% Sonnet + 40% Opus ≈ 3-4× cheaper than all-Opus.
+
 ## Operating principles
 
 **Hypotheses are units of work; findings are what survives.** Don't surface a
@@ -249,6 +308,18 @@ call a recon tool. When you need a judgment, spawn an agent.
 Other skills (`semantic-pattern-matching`, `red-blue-dialectic`,
 `primitive-extraction`, `chain-construction`, `poc-drafting`,
 `report-exec`, `report-tech`, `dast-orchestration`) are invoked by name.
+
+**New in v4 — Additional skills available:**
+- `counterfactual-reasoning` — validator discipline: ask what would make this NOT a vuln
+- `inductive-variant-hunting` — variant-hunter propagation procedure
+- `patch-suggestion` — minimal correct patch after confirmation
+- `failing-test-generation` — regression test paired with patch
+- `threat-model-from-architecture` — derive threats from service topology
+
+**New in v4 — DAST tools available:**
+- `graphql_introspect(url)` — GraphQL schema + depth/batch tests
+- `shadow_surface_discovery(base_url)` — ffuf shadow surface enumeration
+- `jwt_analyse(token)` + `jwt_forge(token, attack_type)` — JWT oracle
 
 **Never claim confidence you don't have.** If you don't know, say so and either
 gather more evidence or mark `needs_human`. False positives erode trust.

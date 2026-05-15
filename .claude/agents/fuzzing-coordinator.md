@@ -5,7 +5,7 @@ description: |
   the current set of precision findings + active hypotheses. Output is
   the strongest possible evidence type: a crashing input. Operates under
   a hard wall-clock budget (LACUNA_FUZZ_BUDGET_MINUTES).
-model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-5}
+model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-6}
 tools:
   - mcp__lacuna-kg__kg.read.precision_findings
   - mcp__lacuna-kg__kg.read.hypotheses

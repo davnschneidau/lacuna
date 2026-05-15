@@ -193,6 +193,100 @@ def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 300) -> tuple[i
         return 127, "", str(e)
 
 
+# ─── diff-scope filter ───────────────────────────────────────────────────────
+
+_DIFF_SCOPE_CACHE: dict | None = None
+_DIFF_SCOPE_LOADED = False
+
+
+def _diff_scope() -> dict | None:
+    """Load the diff scope from LACUNA_DIFF_SCOPE_JSON (cached after first load)."""
+    global _DIFF_SCOPE_CACHE, _DIFF_SCOPE_LOADED
+    if _DIFF_SCOPE_LOADED:
+        return _DIFF_SCOPE_CACHE
+    _DIFF_SCOPE_LOADED = True
+    raw = os.environ.get("LACUNA_DIFF_SCOPE_JSON")
+    if not raw:
+        _DIFF_SCOPE_CACHE = None
+        return None
+    try:
+        import json as _json
+        _DIFF_SCOPE_CACHE = _json.loads(raw)
+    except Exception:
+        _DIFF_SCOPE_CACHE = None
+    return _DIFF_SCOPE_CACHE
+
+
+def _in_diff_scope(repo: str, filepath: str) -> bool:
+    """Return True if the file should be included when diff mode is active.
+
+    When no diff scope is configured (full scan), always returns True.
+    When diff scope is active, returns True only for files in the scope.
+    """
+    scope = _diff_scope()
+    if scope is None:
+        return True
+    if scope.get("repo") != repo:
+        return True
+    all_files: set[str] = set()
+    all_files.update(scope.get("changed_files", []))
+    all_files.update(scope.get("transitive_files", []))
+    all_files.update(scope.get("affected_handler_files", []))
+    clean = filepath.lstrip("/").replace("\\", "/")
+    return clean in all_files
+
+
+def _diff_scope_annotation(repo: str) -> dict:
+    """Return a note for tool results explaining what scope filtering was applied."""
+    scope = _diff_scope()
+    if scope is None or scope.get("repo") != repo:
+        return {}
+    total = (
+        len(scope.get("changed_files", []))
+        + len(scope.get("transitive_files", []))
+        + len(scope.get("affected_handler_files", []))
+    )
+    return {
+        "diff_scope_active": True,
+        "diff_base": scope.get("base_ref"),
+        "diff_head": scope.get("head_ref"),
+        "files_in_scope": total,
+    }
+
+
+# ─── tool-call result cache ─────────────────────────────────────────────────
+
+def _with_cache(repo_name: str, tool: str, args_key: dict, compute_fn: Any) -> Any:
+    """Try to serve result from disk cache; compute and store on miss.
+
+    Args:
+        repo_name: The repository name (used in cache key).
+        tool:      Tool name string (used in cache key).
+        args_key:  Dict of args that uniquely identify this call.
+        compute_fn: Zero-arg callable that returns the result.
+
+    Returns whatever compute_fn() returns, cached on disk.
+    """
+    if os.environ.get("LACUNA_CACHE_DISABLED", "").lower() in ("1", "true", "yes"):
+        return compute_fn()
+    try:
+        from lacuna.cache import cache_key, get_cache
+        from lacuna.cache.disk_cache import git_sha_for
+        repos = _repo_paths()
+        root = repos.get(repo_name)
+        sha = git_sha_for(root) if root else "unknown"
+        key = cache_key(repo_name, tool, sha, **args_key)
+        c = get_cache()
+        hit = c.get(key)
+        if hit is not None:
+            return hit
+        result = compute_fn()
+        c.put(key, result)
+        return result
+    except Exception:
+        return compute_fn()
+
+
 # ─── tools ──────────────────────────────────────────────────────────────────
 
 @server.list_tools()
@@ -328,6 +422,70 @@ async def list_tools() -> list[Tool]:
 
         Tool(name="crypto_usage", description=(
             "All cryptographic API call sites."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="jwt_usage", description=(
+            "Find all JWT library call sites. Reports: decode/verify calls, "
+            "algorithm acceptance (especially alg=none or no algorithm allowlist), "
+            "public key locations, secret locations, verification bypass patterns "
+            "(verify=False, options={'verify_signature': False}). "
+            "Feed results to hunter-crypto or hunter-authn-authz."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="oauth_flows", description=(
+            "Detect OAuth 2.0 / OIDC implementations. Returns flow types "
+            "(authorization_code, implicit, hybrid, client_credentials, device), "
+            "library used, and configuration file locations."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="oauth_endpoints", description=(
+            "Enumerate OAuth/OIDC endpoint registrations: /authorize, /token, "
+            "/userinfo, /jwks, /introspect, /revoke, /device. Returns file + line."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="oauth_config_audit", description=(
+            "Parse OAuth client configuration and flag missing security controls: "
+            "PKCE (code_challenge_method), state parameter, nonce, redirect_uri "
+            "validation, algorithm pinning, and hardcoded client secrets."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="mass_assignment_surface", description=(
+            "Find ORM model-binding call sites: places where request body is "
+            "deserialized directly into a model object. Reports model name, "
+            "binding call, whether an allowlist (fields/attr_accessible/"
+            "__fields__) is declared, and sensitive field names in that model "
+            "(role, is_admin, price, balance, token, confirmed, etc.)."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="js_bundle_analysis", description=(
+            "Analyse JavaScript bundles and sourcemaps in the repo. Reports: "
+            "API endpoints extracted from bundle, hardcoded secrets/keys/tokens, "
+            "internal hostnames, debug flags, sourcemap availability, and "
+            "framework-level configurations. Feed results to hunters before "
+            "DAST crawling."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="ci_config_audit", description=(
+            "Audit CI/CD pipeline configurations for supply-chain vulnerabilities. "
+            "Detects: script injection via context variables, unpinned action "
+            "versions, secrets in YAML, cache poisoning vectors, fork-PR on "
+            "self-hosted runners, over-permissioned GITHUB_TOKEN, and unsafe "
+            "artifact publishing patterns."
+        ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
+                         "required": ["repo"]}),
+
+        Tool(name="known_cve_matches", description=(
+            "Cross-reference dependency_graph results against the Lacuna CVE corpus. "
+            "Returns CVEs that apply to libraries at the exact versions in use. "
+            "Covers npm/pypi/maven/go. No network required — uses bundled corpus. "
+            "Best called after dependency_graph, or will call it automatically."
         ), inputSchema={"type": "object", "properties": {"repo": {"type": "string"}},
                          "required": ["repo"]}),
 
@@ -747,6 +905,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _tool_framework_detect(arguments)
         if name == "crypto_usage":
             return _tool_semgrep_pattern(arguments, "crypto")
+        if name == "jwt_usage":
+            return _tool_jwt_usage(arguments)
+        if name == "oauth_flows":
+            return _tool_oauth_flows(arguments)
+        if name == "oauth_endpoints":
+            return _tool_oauth_endpoints(arguments)
+        if name == "oauth_config_audit":
+            return _tool_oauth_config_audit(arguments)
+        if name == "mass_assignment_surface":
+            return _tool_mass_assignment_surface(arguments)
+        if name == "js_bundle_analysis":
+            return _tool_js_bundle_analysis(arguments)
+        if name == "ci_config_audit":
+            return _tool_ci_config_audit(arguments)
+        if name == "known_cve_matches":
+            return _tool_known_cve_matches(arguments)
         if name == "serialize_calls":
             return _tool_semgrep_pattern(arguments, "serialize")
         if name == "template_engines":
@@ -1030,7 +1204,15 @@ def _tool_dependency_graph(args: dict) -> list[TextContent]:
                                  "version": m.group(2), "scope": "runtime"})
 
     ecosystems = Counter(d["ecosystem"] for d in deps)
+    payload = {
+        "summary": f"{len(deps)} dependencies across {len(ecosystems)} ecosystems: " +
+                   ", ".join(f"{e}({c})" for e, c in ecosystems.most_common()),
+        "facets": {"by_ecosystem": dict(ecosystems)},
+        "handles": deps[:200],
+        "payload_ref": _stash_payload(f"deps-{repo_name}", deps) if len(deps) > 200 else None,
+    }
 
+    # KG persistence is always done (even on cache hits) so the KG stays current.
     try:
         from lacuna.kg import open_kg
         kg = open_kg()
@@ -1039,16 +1221,9 @@ def _tool_dependency_graph(args: dict) -> list[TextContent]:
         finally:
             kg.close()
     except Exception:
-        # KG persistence is best-effort — the tool still returns its results.
         pass
 
-    return _ok({
-        "summary": f"{len(deps)} dependencies across {len(ecosystems)} ecosystems: " +
-                   ", ".join(f"{e}({c})" for e, c in ecosystems.most_common()),
-        "facets": {"by_ecosystem": dict(ecosystems)},
-        "handles": deps[:200],
-        "payload_ref": _stash_payload(f"deps-{repo_name}", deps) if len(deps) > 200 else None,
-    })
+    return _ok(payload)
 
 
 def _tool_dependency_vulns(args: dict) -> list[TextContent]:
@@ -1188,6 +1363,9 @@ def _tool_entrypoints(args: dict) -> list[TextContent]:
         if f.suffix.lower() not in {".py", ".js", ".ts", ".tsx", ".jsx",
                                       ".go", ".java", ".rb"}:
             continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        if not _in_diff_scope(repo_name, rel):
+            continue
         try:
             text = f.read_text(errors="ignore")
         except OSError:
@@ -1199,15 +1377,17 @@ def _tool_entrypoints(args: dict) -> list[TextContent]:
                 line_no = text.count("\n", 0, m.start()) + 1
                 handles.append({
                     "framework": framework, "path": path,
-                    "file": str(f.relative_to(root)), "line": line_no,
+                    "file": rel, "line": line_no,
                 })
     by_fw = Counter(h["framework"] for h in handles)
-    return _ok({
+    result = {
         "summary": f"{len(handles)} entrypoints across {len(by_fw)} frameworks",
         "facets": {"by_framework": dict(by_fw)},
         "handles": handles[:300],
         "payload_ref": _stash_payload(f"entrypoints-{repo_name}", handles) if len(handles) > 300 else None,
-    })
+    }
+    result.update(_diff_scope_annotation(repo_name))
+    return _ok(result)
 
 
 def _tool_api_surface(args: dict) -> list[TextContent]:
@@ -1364,6 +1544,9 @@ def _scan_patterns(args: dict, patterns: dict[str, list[str]], label: str) -> li
     }
     hits: list[dict] = []
     for f in _iter_files(root):
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        if not _in_diff_scope(repo_name, rel):
+            continue
         try:
             text = f.read_text(errors="ignore")
         except OSError:
@@ -1374,17 +1557,19 @@ def _scan_patterns(args: dict, patterns: dict[str, list[str]], label: str) -> li
                     line_no = text.count("\n", 0, m.start()) + 1
                     hits.append({
                         "kind": kind, "match": m.group(0)[:80],
-                        "file": str(f.relative_to(root)), "line": line_no,
+                        "file": rel, "line": line_no,
                     })
                     if len(hits) >= 1500:
                         break
     by_kind = Counter(h["kind"] for h in hits)
-    return _ok({
+    result = {
         "summary": f"{len(hits)} {label} sites across {len(by_kind)} kinds",
         "facets": {"by_kind": dict(by_kind)},
         "handles": hits[:300],
         "payload_ref": _stash_payload(f"{label}-{repo_name}", hits) if len(hits) > 300 else None,
-    })
+    }
+    result.update(_diff_scope_annotation(repo_name))
+    return _ok(result)
 
 
 def _tool_taint_paths(args: dict) -> list[TextContent]:
@@ -1393,36 +1578,42 @@ def _tool_taint_paths(args: dict) -> list[TextContent]:
     if repo_name not in repos:
         return _err(f"unknown repo: {repo_name}")
     root = repos[repo_name]
-    # Use semgrep's built-in security ruleset as a baseline taint signal.
-    rc, out, err = _run(
-        ["semgrep", "--config", "auto", "--json",
-         "--timeout", "120", "--metrics", "off", str(root)],
-        timeout=900,
-    )
-    if rc not in (0, 1):
-        return _err(f"semgrep failed: {err.strip()[:300]}")
-    try:
-        report = json.loads(out) if out.strip() else {}
-    except json.JSONDecodeError:
-        report = {}
-    results = report.get("results", []) or []
-    handles = [
-        {
-            "rule": r.get("check_id"),
-            "severity": (r.get("extra", {}) or {}).get("severity"),
-            "file": r.get("path"),
-            "line": (r.get("start", {}) or {}).get("line"),
-            "message": ((r.get("extra", {}) or {}).get("message") or "")[:200],
+
+    def _compute() -> dict:
+        rc, out, err = _run(
+            ["semgrep", "--config", "auto", "--json",
+             "--timeout", "120", "--metrics", "off", str(root)],
+            timeout=900,
+        )
+        if rc not in (0, 1):
+            return {"error": f"semgrep failed: {err.strip()[:300]}"}
+        try:
+            report = json.loads(out) if out.strip() else {}
+        except json.JSONDecodeError:
+            report = {}
+        results = report.get("results", []) or []
+        handles = [
+            {
+                "rule": r.get("check_id"),
+                "severity": (r.get("extra", {}) or {}).get("severity"),
+                "file": r.get("path"),
+                "line": (r.get("start", {}) or {}).get("line"),
+                "message": ((r.get("extra", {}) or {}).get("message") or "")[:200],
+            }
+            for r in results
+        ]
+        by_sev = Counter(h.get("severity") or "INFO" for h in handles)
+        return {
+            "summary": f"{len(handles)} semgrep taint hits",
+            "facets": {"by_severity": dict(by_sev)},
+            "handles": handles[:200],
+            "payload_ref": _stash_payload(f"semgrep-{repo_name}", handles) if len(handles) > 200 else None,
         }
-        for r in results
-    ]
-    by_sev = Counter(h.get("severity") or "INFO" for h in handles)
-    return _ok({
-        "summary": f"{len(handles)} semgrep taint hits",
-        "facets": {"by_severity": dict(by_sev)},
-        "handles": handles[:200],
-        "payload_ref": _stash_payload(f"semgrep-{repo_name}", handles) if len(handles) > 200 else None,
-    })
+
+    result = _with_cache(repo_name, "taint_paths", {}, _compute)
+    if "error" in result:
+        return _err(result["error"])
+    return _ok(result)
 
 
 CROSS_REPO_CALL_PATTERNS = [
@@ -1596,12 +1787,565 @@ def _tool_framework_detect(args: dict) -> list[TextContent]:
     })
 
 
+_SENSITIVE_FIELDS = re.compile(
+    r"\b(is_admin|admin|role|roles|account_type|user_type|staff|superuser|"
+    r"price|amount|balance|credit|discount|coupon|"
+    r"password|password_hash|passwd|hashed_password|"
+    r"token|api_key|secret|reset_token|confirm_token|"
+    r"confirmed|verified|active|enabled|banned|locked|"
+    r"email_verified|phone_verified)\b",
+    re.I,
+)
+_BINDING_PATTERNS = [
+    re.compile(r"\b(\w+)\s*\(\s*\*\*\s*request\.(json|form|get_json|data)\s*\(\s*\)", re.I),
+    re.compile(r"(\w+)\.new\s*\(\s*params\[", re.I),
+    re.compile(r"(\w+)\.create\s*\(\s*params\[", re.I),
+    re.compile(r"(\w+)\.update\s*\(\s*params\[", re.I),
+    re.compile(r"ModelForm\s*\(\s*request\.(POST|data)", re.I),
+    re.compile(r"BeanUtils\.populate\s*\(", re.I),
+    re.compile(r"\.fromJson\s*\([^,]+,\s*\w+\.class\)", re.I),
+    re.compile(r"objectMapper\.readValue\s*\(", re.I),
+    re.compile(r"json\.Unmarshal\s*\(", re.I),
+    re.compile(r"c\.Bind\s*\(&", re.I),
+]
+_ALLOWLIST_PATTERNS = [
+    re.compile(r"(attr_accessible|fields\s*=|__fields__\s*=|model_fields\s*=|"
+               r"@JsonIgnoreProperties|include\s*=\s*\[|only:\s*\[|"
+               r"strong_params|require\s*\(.*\)\.permit)", re.I),
+]
+
+
+def _tool_mass_assignment_surface(args: dict) -> list[TextContent]:
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+    root = repos[repo_name]
+    sites: list[dict] = []
+    for f in _iter_files(root):
+        if f.suffix.lower() not in {".py", ".rb", ".java", ".go",
+                                      ".ts", ".js", ".php", ".cs", ".kt"}:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        for pat in _BINDING_PATTERNS:
+            for m in pat.finditer(text):
+                line_no = text.count("\n", 0, m.start()) + 1
+                context_start = max(0, m.start() - 300)
+                context_end = min(len(text), m.end() + 300)
+                context = text[context_start:context_end]
+                has_allowlist = any(ap.search(context) for ap in _ALLOWLIST_PATTERNS)
+                sensitive = _SENSITIVE_FIELDS.findall(context)
+                sites.append({
+                    "match": m.group(0)[:100],
+                    "file": rel,
+                    "line": line_no,
+                    "has_allowlist": has_allowlist,
+                    "sensitive_fields_nearby": list(set(sensitive)),
+                })
+    risky = [s for s in sites if not s["has_allowlist"]]
+    sensitive_risky = [s for s in risky if s["sensitive_fields_nearby"]]
+    return _ok({
+        "summary": (
+            f"{len(sites)} model-binding sites, "
+            f"{len(risky)} without allowlist, "
+            f"{len(sensitive_risky)} with sensitive fields exposed"
+        ),
+        "high_risk_sites": sensitive_risky[:50],
+        "no_allowlist_sites": risky[:100],
+        "all_sites": sites[:300],
+    })
+
+
+_JS_SECRET_PATTERNS = [
+    (re.compile(r"['\"]?(api_?key|apikey|x-api-key)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_\-]{16,})['\"]", re.I), "api_key"),
+    (re.compile(r"['\"]?(secret|SECRET)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_\-+/]{16,})['\"]"), "secret"),
+    (re.compile(r"['\"]?(token|TOKEN)['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_.\-]{20,})['\"]"), "token"),
+    (re.compile(r"(REACT_APP_|VUE_APP_|NEXT_PUBLIC_)[A-Z_]+\s*=\s*['\"]([^'\"]{8,})['\"]"), "env_var"),
+    (re.compile(r"(https?://[a-z0-9\-]+\.internal|[a-z0-9\-]+\.corp\.|10\.\d+\.\d+\.\d+)"), "internal_host"),
+    (re.compile(r"debug\s*[:=]\s*true", re.I), "debug_flag"),
+    (re.compile(r"sourceMappingURL\s*=\s*(\S+\.map)"), "sourcemap_ref"),
+]
+_JS_API_ENDPOINT_PAT = re.compile(
+    r"""(?:fetch|axios\.(?:get|post|put|delete|patch)|httpClient\.\w+)\s*\(\s*[`'"]([^`'"]{5,})[`'"]""",
+    re.I,
+)
+
+
+def _tool_js_bundle_analysis(args: dict) -> list[TextContent]:
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+    root = repos[repo_name]
+    secrets: list[dict] = []
+    endpoints: list[dict] = []
+    sourcemaps: list[str] = []
+    for f in _iter_files(root):
+        if f.suffix.lower() not in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".map"}:
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        if f.suffix.lower() == ".map":
+            sourcemaps.append(rel)
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        for pat, kind in _JS_SECRET_PATTERNS:
+            for m in pat.finditer(text):
+                line_no = text.count("\n", 0, m.start()) + 1
+                val = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
+                secrets.append({"kind": kind, "value": val[:60], "file": rel, "line": line_no})
+        for m in _JS_API_ENDPOINT_PAT.finditer(text):
+            ep = m.group(1)
+            if ep.startswith(("/", "http")) and len(ep) > 5:
+                line_no = text.count("\n", 0, m.start()) + 1
+                endpoints.append({"endpoint": ep[:200], "file": rel, "line": line_no})
+    by_kind = Counter(s["kind"] for s in secrets)
+    crit = [s for s in secrets if s["kind"] in ("api_key", "secret", "token")]
+    return _ok({
+        "summary": (
+            f"{len(endpoints)} API endpoints, {len(secrets)} secrets/flags "
+            f"({len(crit)} critical), {len(sourcemaps)} sourcemaps"
+        ),
+        "critical_secrets": crit[:50],
+        "all_secrets": secrets[:200],
+        "api_endpoints": endpoints[:300],
+        "sourcemaps": sourcemaps[:50],
+        "facets": {"by_secret_kind": dict(by_kind)},
+    })
+
+
+def _tool_known_cve_matches(args: dict) -> list[TextContent]:
+    from lacuna.patches.cve_mapper import map_dependencies
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+
+    dep_result = _tool_dependency_graph({"repo": repo_name})
+    try:
+        dep_data = json.loads(dep_result[0].text)
+        deps = dep_data.get("handles", []) or []
+    except Exception:
+        deps = []
+
+    hits = map_dependencies(deps)
+    by_sev = Counter(h["severity"] for h in hits)
+    critical = [h for h in hits if h["severity"] == "critical"]
+    return _ok({
+        "summary": (
+            f"{len(hits)} CVE matches across {len(deps)} dependencies: "
+            f"{by_sev.get('critical', 0)} critical, {by_sev.get('high', 0)} high"
+        ),
+        "critical_matches": critical[:50],
+        "all_matches": hits[:200],
+        "facets": {"by_severity": dict(by_sev)},
+    })
+
+
+_CI_CONFIG_GLOBS = [
+    ".github/workflows/*.yml", ".github/workflows/*.yaml",
+    ".gitlab-ci.yml", ".gitlab-ci.yaml",
+    "bitbucket-pipelines.yml", "bitbucket-pipelines.yaml",
+    ".circleci/config.yml", ".circleci/config.yaml",
+    "Jenkinsfile", ".drone.yml",
+    ".travis.yml", "appveyor.yml",
+    "azure-pipelines.yml",
+]
+_CI_INJECTION_PAT = re.compile(
+    r"\$\{\{\s*(github\.event\.(pull_request|issue|comment|head_commit)"
+    r"|github\.head_ref|github\.actor)\b",
+    re.I,
+)
+_CI_UNPINNED_ACTION_PAT = re.compile(
+    r"uses:\s+([A-Za-z0-9_\-./]+)@(main|master|latest|HEAD|v\d+(?:\.\d+)?(?!\.\d))\b"
+)
+_CI_SECRET_PAT = re.compile(
+    r"(?:password|token|secret|key|apikey|api_key|credential)\s*[:=]\s*['\"]([^'\"]{8,})['\"]",
+    re.I,
+)
+_CI_PERMISSIONS_PAT = re.compile(
+    r"permissions\s*:\s*write-all|\bcontents\s*:\s*write\b", re.I
+)
+_CI_FORK_SELF_HOSTED_PAT = re.compile(
+    r"runs-on\s*:\s*self-hosted", re.I
+)
+
+
+def _tool_ci_config_audit(args: dict) -> list[TextContent]:
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+    root = repos[repo_name]
+
+    issues: list[dict] = []
+    ci_files: list[str] = []
+
+    for f in _iter_files(root):
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        is_ci = any(
+            re.match(glob.replace("*", "[^/]+"), rel)
+            for glob in _CI_CONFIG_GLOBS
+        ) or f.name in {"Jenkinsfile", ".travis.yml", "appveyor.yml",
+                         "azure-pipelines.yml", ".drone.yml"}
+        if not is_ci:
+            continue
+        ci_files.append(rel)
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+
+        for m in _CI_INJECTION_PAT.finditer(text):
+            line_no = text.count("\n", 0, m.start()) + 1
+            issues.append({
+                "kind": "script_injection",
+                "severity": "critical",
+                "match": m.group(0)[:120],
+                "file": rel,
+                "line": line_no,
+                "description": "Context variable in run: step — potential pipeline script injection",
+            })
+        for m in _CI_UNPINNED_ACTION_PAT.finditer(text):
+            line_no = text.count("\n", 0, m.start()) + 1
+            action, ref = m.group(1), m.group(2)
+            issues.append({
+                "kind": "unpinned_action",
+                "severity": "high",
+                "match": m.group(0)[:120],
+                "file": rel,
+                "line": line_no,
+                "description": f"Action {action!r} pinned to mutable ref {ref!r}",
+            })
+        for m in _CI_SECRET_PAT.finditer(text):
+            line_no = text.count("\n", 0, m.start()) + 1
+            issues.append({
+                "kind": "hardcoded_secret",
+                "severity": "critical",
+                "match": m.group(0)[:100],
+                "file": rel,
+                "line": line_no,
+                "description": "Possible hardcoded secret in CI config",
+            })
+        for m in _CI_PERMISSIONS_PAT.finditer(text):
+            line_no = text.count("\n", 0, m.start()) + 1
+            issues.append({
+                "kind": "overpermissioned_token",
+                "severity": "high",
+                "match": m.group(0)[:80],
+                "file": rel,
+                "line": line_no,
+                "description": "Workflow has write-all or broad write permissions",
+            })
+        if _CI_FORK_SELF_HOSTED_PAT.search(text):
+            line_no = (text.count("\n", 0,
+                       _CI_FORK_SELF_HOSTED_PAT.search(text).start()) + 1)
+            issues.append({
+                "kind": "fork_pr_self_hosted",
+                "severity": "high",
+                "match": "runs-on: self-hosted",
+                "file": rel,
+                "line": line_no,
+                "description": "Self-hosted runner may execute untrusted fork PR code",
+            })
+
+    by_sev = Counter(i["severity"] for i in issues)
+    critical = [i for i in issues if i["severity"] == "critical"]
+    return _ok({
+        "summary": (
+            f"{len(ci_files)} CI config files, {len(issues)} issues "
+            f"({by_sev.get('critical', 0)} critical, {by_sev.get('high', 0)} high)"
+        ),
+        "ci_files": ci_files,
+        "critical_issues": critical[:50],
+        "all_issues": issues[:200],
+        "facets": {"by_severity": dict(by_sev)},
+    })
+
+
 SEMGREP_INLINE_RULESETS = {
     "crypto": "p/crypto",
     "serialize": "p/insecure-deserialization",
     "template": "p/owasp-top-ten",
     "regex": "r/generic.secrets",
 }
+
+
+_OAUTH_LIB_PATTERNS = [
+    (re.compile(r"(authlib|requests_oauthlib|oauthlib|python-jose|jose)", re.I), "python"),
+    (re.compile(r"(passport|passport-oauth2|openid-client|node-oidc-provider)", re.I), "node"),
+    (re.compile(r"(spring-security-oauth|keycloak|nimbus-jose-jwt)", re.I), "java"),
+    (re.compile(r"(omniauth|doorkeeper|rack-oauth2)", re.I), "ruby"),
+    (re.compile(r"(golang\.org/x/oauth2|ory/fosite|coreos/go-oidc)", re.I), "go"),
+]
+_OAUTH_FLOW_PATTERNS = {
+    "authorization_code": re.compile(
+        r"(response_type\s*=\s*['\"]code['\"]|grant_type\s*=\s*['\"]authorization_code['\"])",
+        re.I,
+    ),
+    "implicit": re.compile(r"response_type\s*=\s*['\"]token['\"]", re.I),
+    "client_credentials": re.compile(
+        r"grant_type\s*=\s*['\"]client_credentials['\"]", re.I
+    ),
+    "device": re.compile(
+        r"(grant_type\s*=\s*['\"]urn:ietf:params:oauth:grant-type:device_code['\"]"
+        r"|device_authorization_endpoint)", re.I,
+    ),
+    "hybrid": re.compile(r"response_type\s*=\s*['\"]code\s+id_token['\"]", re.I),
+}
+_OAUTH_ENDPOINT_PATTERNS = {
+    "authorize": re.compile(r"/authorize|/oauth/authorize|/connect/authorize", re.I),
+    "token": re.compile(r"/token|/oauth/token|/connect/token", re.I),
+    "userinfo": re.compile(r"/userinfo|/oauth/userinfo|/connect/userinfo", re.I),
+    "jwks": re.compile(r"/jwks|/jwks\.json|\.well-known/jwks", re.I),
+    "introspect": re.compile(r"/introspect|/oauth/introspect", re.I),
+    "revoke": re.compile(r"/revoke|/oauth/revoke", re.I),
+    "device": re.compile(r"/device_authorization|/oauth/device", re.I),
+}
+_OAUTH_MISSING_CONTROLS = {
+    "missing_state": re.compile(
+        r"(oauth\.authorize|redirect.*authorize|requests\.get.*authorize)"
+        r"(?!.*state\s*=)", re.I | re.S,
+    ),
+    "missing_pkce": re.compile(
+        r"(authorization_code|response_type.*code)(?!.*code_challenge)", re.I | re.S
+    ),
+    "missing_nonce": re.compile(
+        r"(id_token|openid)(?!.*nonce\s*=)", re.I | re.S
+    ),
+    "redirect_uri_wildcard": re.compile(r"redirect_uri.*\*", re.I),
+    "redirect_uri_prefix_only": re.compile(
+        r"startswith\s*\([^)]*redirect_uri|redirect_uri.*startswith", re.I
+    ),
+    "client_secret_hardcoded": re.compile(
+        r"client_secret\s*=\s*['\"][A-Za-z0-9_\-]{8,}['\"]", re.I
+    ),
+    "implicit_flow": re.compile(
+        r"response_type\s*=\s*['\"]token['\"]", re.I
+    ),
+    "no_alg_pinning": re.compile(
+        r"decode\s*\([^)]*\)(?!.*algorithms\s*=)", re.I
+    ),
+}
+
+
+def _tool_oauth_flows(args: dict) -> list[TextContent]:
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+    root = repos[repo_name]
+    flows: list[dict] = []
+    libs_found: set[str] = set()
+    for f in _iter_files(root):
+        if f.suffix.lower() not in {".py", ".js", ".ts", ".java", ".go",
+                                      ".rb", ".json", ".yaml", ".yml", ".toml"}:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        for pat, lang in _OAUTH_LIB_PATTERNS:
+            for m in pat.finditer(text):
+                libs_found.add(m.group(1).lower())
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        for flow_name, pat in _OAUTH_FLOW_PATTERNS.items():
+            if pat.search(text):
+                line_no = text.count("\n", 0, pat.search(text).start()) + 1
+                flows.append({"flow": flow_name, "file": rel, "line": line_no})
+    return _ok({
+        "summary": f"{len(flows)} OAuth/OIDC flow sites, libraries: {sorted(libs_found)}",
+        "libraries": sorted(libs_found),
+        "flows": flows[:200],
+    })
+
+
+def _tool_oauth_endpoints(args: dict) -> list[TextContent]:
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+    root = repos[repo_name]
+    endpoints: list[dict] = []
+    for f in _iter_files(root):
+        if f.suffix.lower() not in {".py", ".js", ".ts", ".java", ".go", ".rb", ".yaml", ".yml"}:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        for ep_name, pat in _OAUTH_ENDPOINT_PATTERNS.items():
+            for m in pat.finditer(text):
+                line_no = text.count("\n", 0, m.start()) + 1
+                endpoints.append({
+                    "endpoint_type": ep_name,
+                    "match": m.group(0)[:80],
+                    "file": rel,
+                    "line": line_no,
+                })
+    by_type = Counter(e["endpoint_type"] for e in endpoints)
+    return _ok({
+        "summary": f"{len(endpoints)} OAuth endpoint registrations across {len(by_type)} types",
+        "facets": {"by_type": dict(by_type)},
+        "handles": endpoints[:300],
+    })
+
+
+def _tool_oauth_config_audit(args: dict) -> list[TextContent]:
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+    root = repos[repo_name]
+    issues: list[dict] = []
+    for f in _iter_files(root):
+        if f.suffix.lower() not in {".py", ".js", ".ts", ".java", ".go",
+                                      ".rb", ".json", ".yaml", ".yml", ".env",
+                                      ".config", ".toml"}:
+            continue
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        if not any(kw in text.lower() for kw in ("oauth", "oidc", "client_id", "authorize")):
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        for issue_name, pat in _OAUTH_MISSING_CONTROLS.items():
+            for m in pat.finditer(text):
+                line_no = text.count("\n", 0, m.start()) + 1
+                issues.append({
+                    "issue": issue_name,
+                    "match": m.group(0)[:120],
+                    "file": rel,
+                    "line": line_no,
+                    "severity": _oauth_issue_severity(issue_name),
+                })
+    critical = [i for i in issues if i["severity"] == "critical"]
+    high = [i for i in issues if i["severity"] == "high"]
+    return _ok({
+        "summary": (
+            f"{len(issues)} OAuth configuration issues: "
+            f"{len(critical)} critical, {len(high)} high"
+        ),
+        "critical_issues": critical[:50],
+        "high_issues": high[:50],
+        "all_issues": issues[:300],
+    })
+
+
+def _oauth_issue_severity(issue: str) -> str:
+    _SEVERITY = {
+        "client_secret_hardcoded": "critical",
+        "missing_pkce": "high",
+        "missing_state": "high",
+        "implicit_flow": "high",
+        "redirect_uri_wildcard": "critical",
+        "redirect_uri_prefix_only": "high",
+        "missing_nonce": "medium",
+        "no_alg_pinning": "medium",
+    }
+    return _SEVERITY.get(issue, "medium")
+
+
+_JWT_PATTERNS = {
+    "decode_no_verify": [
+        r"jwt\.decode\s*\([^)]*verify\s*=\s*False",
+        r"jwt\.decode\s*\([^)]*verify_signature.*False",
+        r"jwt\.decode\s*\([^)]*algorithms\s*=\s*\[\s*['\"]none['\"]",
+        r"decode\s*\([^)]*options\s*=\s*\{[^}]*verify_signature.*False",
+    ],
+    "alg_none_accepted": [
+        r"algorithms\s*=\s*\[[^\]]*['\"]none['\"]",
+        r"algorithms\s*=\s*\[[^\]]*['\"]None['\"]",
+        r"ALGORITHMS\s*=\s*\[[^\]]*['\"]none['\"]",
+    ],
+    "no_algorithm_allowlist": [
+        r"jwt\.decode\s*\([^)]*\)\s*(?!.*algorithms)",
+        r"verify_jwt\s*\(",
+        r"JWT\.decode\s*\(",
+    ],
+    "secret_hardcoded": [
+        r"jwt\.decode\s*\([^,]+,\s*['\"][A-Za-z0-9+/=]{8,}['\"]",
+        r"JWT_SECRET\s*=\s*['\"][^'\"]{4,}['\"]",
+        r"jwt_secret\s*=\s*['\"][^'\"]{4,}['\"]",
+        r"SECRET_KEY\s*=\s*['\"][^'\"]{4,}['\"]",
+    ],
+    "decode_call": [
+        r"jwt\.decode\s*\(",
+        r"JWT\.decode\s*\(",
+        r"JsonWebToken\.verify\s*\(",
+        r"jwtDecode\s*\(",
+        r"verifyToken\s*\(",
+        r"Jwts\.parser\s*\(",
+    ],
+    "public_key_load": [
+        r"open\s*\([^)]*\.pem",
+        r"open\s*\([^)]*\.pub",
+        r"load_pem_public_key\s*\(",
+        r"RSA\.import_key\s*\(",
+        r"jwks_uri",
+        r"\.well-known/jwks",
+    ],
+}
+
+
+def _tool_jwt_usage(args: dict) -> list[TextContent]:
+    repo_name = args["repo"]
+    repos = _repo_paths()
+    if repo_name not in repos:
+        return _err(f"unknown repo: {repo_name}")
+    root = repos[repo_name]
+
+    compiled = {
+        kind: [re.compile(p) for p in pats]
+        for kind, pats in _JWT_PATTERNS.items()
+    }
+
+    hits: list[dict] = []
+    for f in _iter_files(root):
+        if f.suffix.lower() not in {".py", ".js", ".ts", ".java", ".go",
+                                      ".rb", ".php", ".cs", ".kt"}:
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        try:
+            text = f.read_text(errors="ignore")
+        except OSError:
+            continue
+        if not any(kw in text for kw in ("jwt", "JWT", "JsonWebToken", "jwtDecode")):
+            continue
+        for kind, pats in compiled.items():
+            for pat in pats:
+                for m in pat.finditer(text):
+                    line_no = text.count("\n", 0, m.start()) + 1
+                    hits.append({
+                        "kind": kind,
+                        "match": m.group(0)[:120],
+                        "file": rel,
+                        "line": line_no,
+                    })
+
+    by_kind = Counter(h["kind"] for h in hits)
+    risky = [h for h in hits if h["kind"] in (
+        "decode_no_verify", "alg_none_accepted", "no_algorithm_allowlist", "secret_hardcoded"
+    )]
+
+    return _ok({
+        "summary": (
+            f"{len(hits)} JWT-related sites ({len(risky)} potentially dangerous) "
+            f"across {len(by_kind)} categories"
+        ),
+        "facets": {"by_kind": dict(by_kind)},
+        "risky_sites": risky[:100],
+        "all_sites": hits[:300],
+        "payload_ref": _stash_payload(f"jwt-{repo_name}", hits) if len(hits) > 300 else None,
+    })
 
 
 def _tool_semgrep_pattern(args: dict, kind: str) -> list[TextContent]:
@@ -1934,18 +2678,26 @@ def _tool_custom_semgrep_scan(args: dict) -> list[TextContent]:
     detected_languages = list(
         ((langs.get("facets") or {}).get("files_by_lang") or {}).keys()
     ) if isinstance(langs, dict) else []
-    ruleset = build_ruleset(root, detected_frameworks, detected_languages)
-    result = run_custom_semgrep(root, ruleset)
-    handles = result.get("handles") or []
-    by_rule: Counter[str] = Counter(h.get("rule") or "?" for h in handles)
-    by_severity: Counter[str] = Counter(h.get("severity") or "?" for h in handles)
-    result["facets"] = {
-        "by_rule": dict(by_rule),
-        "by_severity": dict(by_severity),
-        "rules_run": result.get("rules_count", 0),
-        "frameworks_detected": detected_frameworks,
-        "languages_detected": detected_languages,
-    }
+    def _compute() -> dict:
+        ruleset = build_ruleset(root, detected_frameworks, detected_languages)
+        r = run_custom_semgrep(root, ruleset)
+        hs = r.get("handles") or []
+        br: Counter[str] = Counter(h.get("rule") or "?" for h in hs)
+        bs: Counter[str] = Counter(h.get("severity") or "?" for h in hs)
+        r["facets"] = {
+            "by_rule": dict(br),
+            "by_severity": dict(bs),
+            "rules_run": r.get("rules_count", 0),
+            "frameworks_detected": detected_frameworks,
+            "languages_detected": detected_languages,
+        }
+        return r
+
+    result = _with_cache(
+        repo_name, "custom_semgrep_scan",
+        {"frameworks": sorted(detected_frameworks), "languages": sorted(detected_languages)},
+        _compute,
+    )
     return _ok(result)
 
 

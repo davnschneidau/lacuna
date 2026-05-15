@@ -2,7 +2,7 @@
 name: hunter-memory
 description: |
   Form hypotheses about memory-safety issues in native code or unsafe regions of memory-safe languages.
-model: ${LACUNA_MODEL_SONNET:-claude-sonnet-4-5}
+model: ${LACUNA_MODEL_OPUS:-claude-opus-4-7}
 tools:
   - mcp__lacuna-kg__kg.read.application_model
   - mcp__lacuna-kg__kg.read.status

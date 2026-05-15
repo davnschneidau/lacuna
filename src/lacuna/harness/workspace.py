@@ -280,19 +280,28 @@ def _stage_claude_config(workspace: Path) -> None:
     _log(f"staged claude config into {dst}")
 
 
-def _kickoff_prompt(manifest: dict, mode: str) -> str:
+def _kickoff_prompt(manifest: dict, mode: str, diff_summary: str = "") -> str:
     app = manifest.get("application", {}) or {}
     repos = ", ".join(r.get("name", "?") for r in manifest.get("repos", []) or [])
-    return (
+    base = (
         f"Begin a Lacuna scan of application '{app.get('name', 'unknown')}'.\n"
         f"Mode: {mode}.\n"
         f"Repos in scope: {repos}.\n"
-        f"\n"
-        f"Follow your system prompt. Start by reading the manifest and "
+    )
+    if diff_summary:
+        base += (
+            f"\nDIFF SCOPE ACTIVE: {diff_summary}\n"
+            f"Only analyse files listed in LACUNA_DIFF_SCOPE_JSON. Recon tools "
+            f"will automatically filter to this scope. Spawn only hunters "
+            f"relevant to the changed code types.\n"
+        )
+    base += (
+        f"\nFollow your system prompt. Start by reading the manifest and "
         f"writing the application model. Then proceed to hypothesize, "
         f"validate, chain, and report. The Stop hook will block exit until "
         f"all exit criteria are met.\n"
     )
+    return base
 
 
 def _resolve_wall_clock_hours(passed: float) -> float:
@@ -321,6 +330,9 @@ def _track_budget_usd() -> float | None:
 def run_scan(
     *, manifest_path: Path, workspace: Path, mode: str, fail_on: str,
     wall_clock_hours: float, max_parallel: int,
+    diff_base: str | None = None,
+    diff_head: str = "HEAD",
+    diff_max_depth: int = 3,
 ) -> int:
     """Run the full scan. Returns exit code."""
     if not manifest_path.exists():
@@ -345,6 +357,36 @@ def run_scan(
     workspace.mkdir(parents=True, exist_ok=True)
     _clone_repos(manifest, workspace)
 
+    diff_scope_envs: dict[str, str] = {}
+    diff_summary = ""
+    if mode == "diff" and diff_base:
+        from ..diff import compute_diff_scope
+        repos = manifest.get("repos", []) or []
+        for repo_cfg in repos:
+            repo_name = repo_cfg.get("name", "")
+            repo_path = workspace / repo_name
+            if not repo_path.exists():
+                continue
+            scope = compute_diff_scope(
+                repo_path=repo_path,
+                base_ref=diff_base,
+                head_ref=diff_head,
+                repo_name=repo_name,
+                max_import_depth=diff_max_depth,
+            )
+            if scope.is_empty():
+                _log(f"repo {repo_name}: no changed files in diff, skipping")
+                continue
+            _log(f"repo {repo_name}: {scope.summary()}")
+            diff_scope_envs.update(scope.to_env_dict())
+            diff_summary = scope.summary()
+            kg = open_kg()
+            kg.set_meta("diff_base", diff_base)
+            kg.set_meta("diff_head", diff_head)
+            kg.set_meta("diff_scope_json", diff_scope_envs.get("LACUNA_DIFF_SCOPE_JSON", ""))
+            kg.close()
+            break
+
     _stage_claude_config(workspace)
     _write_mcp_config(workspace)
 
@@ -352,7 +394,7 @@ def run_scan(
     deadline_s = max(60, int(wall_clock_hours * 3600))
     budget_usd = _track_budget_usd()
 
-    prompt = _kickoff_prompt(manifest, mode)
+    prompt = _kickoff_prompt(manifest, mode, diff_summary=diff_summary)
     _log(
         f"invoking Claude Code (deadline {deadline_s}s, "
         f"budget=${budget_usd if budget_usd is not None else 'unlimited'})"
@@ -369,11 +411,13 @@ def run_scan(
         )
         fuzz_budget = "60"
 
-    child_env = _build_child_env(workspace, {
+    extra_env: dict[str, str] = {
         "LACUNA_MODE": mode,
         "LACUNA_MANIFEST_RESOLVED": str(manifest_path),
         "LACUNA_FUZZ_BUDGET_MINUTES": fuzz_budget,
-    })
+    }
+    extra_env.update(diff_scope_envs)
+    child_env = _build_child_env(workspace, extra_env)
 
     cmd = [
         "claude",
@@ -420,6 +464,24 @@ def run_scan(
             _log(f"budget cap check failed: {e}")
 
     _log(f"agent run finished in {elapsed}s with rc={agent_rc}; writing reports")
+
+    # Risk-timeline delta — compare this scan's findings against previous scan
+    try:
+        from ..diff.delta import compute_delta, record_scan_run
+        kg_path = Path(os.environ.get("LACUNA_KG_PATH", "/state/lacuna.db"))
+        delta = compute_delta(current_kg_path=kg_path)
+        scan_id = record_scan_run(
+            kg_path=kg_path,
+            mode=mode,
+            manifest_path=str(manifest_path),
+            diff_base=diff_base if mode == "diff" else None,
+            diff_head=diff_head if mode == "diff" else None,
+            delta=delta,
+        )
+        _log(f"scan-run recorded: {scan_id} — {delta.summary()}")
+    except Exception as e:
+        _log(f"delta recording skipped: {e}")
+
     reports_dir = Path(os.environ.get("LACUNA_REPORTS_DIR", "/reports"))
     write_reports(reports_dir)
 

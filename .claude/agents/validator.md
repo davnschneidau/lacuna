@@ -45,6 +45,9 @@ skills:
   - trust-the-fuzzer
   - interesting-input
   - adversary-pricing
+  - counterfactual-reasoning
+  - patch-suggestion
+  - failing-test-generation
 ---
 
 # Validator
