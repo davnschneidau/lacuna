@@ -2,6 +2,21 @@
 
 > Agentic, multi-repo, application-level security scanner. Mythos-style behavior on top of Claude Code. SAST and DAST in one box. Runs as a Docker container — Bitbucket Cloud pipe or ad-hoc.
 
+**3.1.0** — cost-optimized specialist agents + risk timeline. New in this release:
+
+- **Multi-model tiering** reduces cost 3-4× with negligible quality loss:
+  - Opus for orchestrator, trust-shadow-analyzer, chain-builder, validator, and deep reasoning hunters
+  - Sonnet for recon, pattern-matching hunters, and low-confidence validation
+  - Haiku for skeptic and triage
+  - Target spend: ~15% Haiku + 45% Sonnet + 40% Opus
+- **PR-scoped diff mode** (`LACUNA_MODE=diff`) scans only changed files and their transitive imports
+- **Tool-call result caching** provides 5-10× speedup on repeated scans
+- **JWT forensics oracle** with 6 attack vectors (alg=none, confusion, kid injection, JWKS SSRF, brute-force)
+- **Specialist hunters**: OAuth/OIDC, mass-assignment, SSRF (3-tier), GraphQL, CI/CD supply-chain
+- **Risk-timeline mode** tracks findings across scans with delta analysis (new/fixed/persisted/regressed)
+- **CVE mapper** cross-references dependencies against curated corpus (npm/pypi/maven/go)
+- **Skills**: threat modeling, variant hunting, counterfactual reasoning, patch suggestion, test generation
+
 **3.0.0** — initial public release. Bundles:
 
 * the inter-procedural taint / data-flow engine,
@@ -38,14 +53,16 @@ lacuna/
 │   ├── flow/                 # Inter-procedural taint engine
 │   ├── precision/            # Precision static analysis: integer range, lifetime, format-string, type-confusion
 │   ├── dynamic/              # Sanitizer builds, libFuzzer wrapper, angr symex, differential parsers
-│   ├── patches/              # Patch-essence extraction + variant propagation
-│   ├── oracles/              # sqlmap / ysoserial / gopherus wrappers
-│   ├── tools/                # MCP recon/kg/dast servers + git_history, custom_semgrep, test_coverage, state_machine, gadget_catalog, trust_shadow
-│   ├── dast/                 # Includes Playwright runner for DOM-XSS / postMessage / DOM clobbering
+│   ├── patches/              # Patch-essence extraction + variant propagation, CVE mapper
+│   ├── oracles/              # sqlmap / ysoserial / gopherus / JWT forensics / ffuf wrappers
+│   ├── tools/                # MCP recon/kg/dast servers + git_history, custom_semgrep, test_coverage, state_machine, gadget_catalog, trust_shadow, OAuth/mass-assignment/JS-bundle/CI-config/JWT/CVE tools
+│   ├── dast/                 # Includes Playwright runner for DOM-XSS / postMessage / DOM clobbering, GraphQL introspection, shadow surface discovery
+│   ├── cache/                # Tool-call result caching layer
+│   ├── diff/                 # Diff scope calculator + delta module for risk timeline
 │   └── ...
 ├── .claude/                  # Claude Code config: CLAUDE.md, agents, skills, hooks, settings
-│   ├── agents/               # Hunters + recon + validator + chain-builder + skeptic + trust-shadow-analyzer + patch-archaeologist + variant-hunter + fuzzing-coordinator
-│   └── skills/               # Skills incl. weird-machine, trust-shadow-mapping, minimal-repro, cross-hunter-observations, vulnerability-researcher, trust-the-fuzzer
+│   ├── agents/               # Hunters (injection, crypto, authn-authz, OAuth, mass-assignment, SSRF, GraphQL, business-logic, cross-service, deserialization, race-toctou, memory, CI-supply-chain) + recon + validator + chain-builder + skeptic + trust-shadow-analyzer + patch-archaeologist + variant-hunter + fuzzing-coordinator
+│   └── skills/               # Skills incl. weird-machine, trust-shadow-mapping, minimal-repro, cross-hunter-observations, vulnerability-researcher, trust-the-fuzzer, threat-model-from-architecture, inductive-variant-hunting, counterfactual-reasoning, patch-suggestion, failing-test-generation
 ├── examples/                 # Sample manifest + bitbucket-pipelines.yml
 ├── tests/                    # Unit tests for KG, hooks, MCP servers, flow engine
 └── docs/
@@ -71,7 +88,24 @@ docker run --rm \
   lacuna:dev scan --manifest /workspace/app.lacuna.yaml
 ```
 
-For `sast+dast` mode, set `LACUNA_MODE=sast+dast` and populate the `dast:` section of the manifest. Reports land in `/reports/`.
+For `sast+dast` mode, set `LACUNA_MODE=sast+dast` and populate the `dast:` section of the manifest.
+
+For **diff mode** (PR-scoped scanning):
+```bash
+docker run --rm \
+  -v "$PWD/examples/app.lacuna.yaml:/workspace/app.lacuna.yaml:ro" \
+  -v "$PWD/reports:/reports" \
+  -e AZURE_FOUNDRY_ENDPOINT="https://<your-foundry>.services.ai.azure.com/anthropic" \
+  -e AZURE_FOUNDRY_KEY="<key>" \
+  -e BITBUCKET_USERNAME="<user>" \
+  -e BITBUCKET_APP_PASSWORD="<password>" \
+  -e LACUNA_MODE="diff" \
+  -e LACUNA_DIFF_BASE="main" \
+  -e LACUNA_DIFF_HEAD="feature-branch" \
+  lacuna:dev scan --manifest /workspace/app.lacuna.yaml
+```
+
+Reports land in `/reports/`.
 
 ## Quick start (Bitbucket Pipe)
 
@@ -86,10 +120,14 @@ pipelines:
           name: Lacuna application scan
           services: [docker]
           script:
-            - pipe: docker://your-registry/lacuna:3.0.0
+            - pipe: docker://your-registry/lacuna:3.1.0
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'
+                # For PR-scoped scans:
+                # LACUNA_MODE: 'diff'
+                # LACUNA_DIFF_BASE: 'main'
+                # LACUNA_DIFF_HEAD: '${BITBUCKET_PR_DESTINATION_BRANCH}'
                 AZURE_FOUNDRY_ENDPOINT: $AZURE_FOUNDRY_ENDPOINT
                 AZURE_FOUNDRY_KEY: $AZURE_FOUNDRY_KEY
                 BITBUCKET_USERNAME: $BITBUCKET_USERNAME
@@ -115,7 +153,7 @@ See `examples/bitbucket-pipelines.yml` for a more complete configuration.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LACUNA_MODE` | `sast` | `sast` or `sast+dast` |
+| `LACUNA_MODE` | `sast` | `sast`, `sast+dast`, or `diff` |
 | `LACUNA_MANIFEST` | `app.lacuna.yaml` | Path to manifest, relative to workspace |
 | `LACUNA_FAIL_ON` | `critical` | `none` / `critical` / `high` / `medium` |
 | `LACUNA_MODEL_OPUS` | `claude-opus-4-7` | Deployment name in Foundry |
@@ -124,10 +162,17 @@ See `examples/bitbucket-pipelines.yml` for a more complete configuration.
 | `LACUNA_WALL_CLOCK_HOURS` | `4` | Hard cap per scan |
 | `LACUNA_BUDGET_USD` | `50` | Estimated spend cap |
 | `LACUNA_MAX_PARALLEL_SUBAGENTS` | `8` | Concurrency |
+| `LACUNA_DIFF_BASE` | `main` | Base ref for diff mode |
+| `LACUNA_DIFF_HEAD` | `HEAD` | Head ref for diff mode |
+| `LACUNA_DIFF_MAX_DEPTH` | `3` | Max import hops for diff scope |
+| `LACUNA_FUZZ_BUDGET_MINUTES` | `60` | Dynamic fuzzing budget |
+| `LACUNA_REPORTS_DIR` | `/reports` | Output directory for reports |
 
 ## Persistence
 
-The knowledge graph is **ephemeral**: a fresh SQLite database is created at the start of each scan and lives only for that scan. To compare scans, archive the report artifacts (Bitbucket does this automatically) — there is no built-in cross-scan diffing in this version.
+The knowledge graph is **ephemeral**: a fresh SQLite database is created at the start of each scan and lives only for that scan. 
+
+**Risk-timeline mode** (3.1.0): When enabled, the KG records `scan_runs` and `finding_provenance` tables to track findings across scans. The delta module computes new, fixed, persisted, and regressed findings between runs, enabling "what changed since last time?" queries and CI risk trending.
 
 ## Architecture
 
@@ -150,7 +195,7 @@ v3 organizes its new capabilities into five layered modules:
 
 ## Status
 
-Initial release (3.0.0). Production-shaped but expect rough edges. Some
+Version 3.1.0. Production-shaped but expect rough edges. Some
 oracles (libFuzzer, angr symex, ysoserial, sqlmap, gopherus, Playwright)
 are best-effort wrappers around external tooling — they fail loudly when
 their dependencies are missing rather than silently degrading. Issues,
