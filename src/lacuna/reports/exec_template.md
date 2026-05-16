@@ -1,10 +1,17 @@
 # Security Scan: {{ app_name }}
 
 **Scan Date:** {{ scan_date }}  
-**Scan Mode:** {{ scan_mode }}  
+**Scan Kind:** {{ scan_kind_human }}  
+**Scan Scope:** {{ scan_scope_human }}  
 **Application:** {{ app_name }}  
 **Repos in Scope:** {{ repo_count }} ({{ repo_names }})  
 **Scan Duration:** {{ scan_duration }}  
+
+> The scan kind determines which findings are present. A SAST-only scan
+> rules out *static* defects in the in-scope code; it does not exercise
+> the running application and cannot confirm runtime behaviour. A
+> SAST+DAST scan adds dynamic evidence (HTTP requests, fuzzing, OOB
+> callbacks) for findings the static analysis surfaced as candidates.
 
 ---
 

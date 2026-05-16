@@ -5,6 +5,10 @@ description: |
   is graph search over the primitive ledger: effects of one primitive
   satisfy prerequisites of another. Narrative formatting and severity rules
   included.
+when_to_use:
+  - Chain-builder is running its composition pass over the primitive ledger.
+  - A confirmed finding produced new primitives that may extend existing chains.
+  - A report needs a narrative chain rather than a list of isolated findings.
 ---
 
 # Chain construction
@@ -75,7 +79,7 @@ the composition makes practical sense.
 
 A chain narrative is a step-by-step walkthrough. Format:
 
-```
+```text
 **Actor:** Unauthenticated external attacker.
 
 **Step 1 — <name of primitive 1>**  ({repo})

@@ -57,27 +57,3 @@ def test_smuggling_probe_is_module_level_callable():
     dispatch to it."""
     from lacuna.tools.dast_server import _t_smuggling_probe
     assert callable(_t_smuggling_probe)
-
-
-def test_endpoint_enum_parses_json_openapi(tmp_path):
-    """OpenAPI detection should attempt a real JSON parse rather than
-    relying on the first byte being ``{``. This test feeds a JSON spec
-    nested inside arbitrary leading whitespace to confirm the JSON-first
-    branch actually parses."""
-    import importlib
-
-    from lacuna.tools import dast_server
-    importlib.reload(dast_server)
-    # Internal helper for OpenAPI parsing — we don't have a synchronous
-    # entrypoint to the full crawl, but we can verify the helper detects
-    # the structure correctly.
-    raw = (
-        "    \n"
-        + json.dumps({
-            "openapi": "3.0.0",
-            "paths": {"/x": {"get": {"responses": {"200": {"description": "ok"}}}}},
-        })
-    )
-    parsed = json.loads(raw)
-    assert parsed["openapi"].startswith("3.")
-    assert "/x" in parsed["paths"]

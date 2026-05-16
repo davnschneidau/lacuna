@@ -5,6 +5,10 @@ description: |
   "shape" is not a regex; it's an intent-plus-context pattern. This skill
   defines the shapes Lacuna hunts and the syntactic vs semantic signals that
   distinguish a real instance from a false positive.
+when_to_use:
+  - A hunter is scanning a region of code and needs to recognize shapes, not strings.
+  - You are tempted to ship a regex-based hypothesis — re-read this skill first.
+  - The triage-classifier is deciding whether two hypotheses describe the same shape.
 ---
 
 # Semantic pattern matching

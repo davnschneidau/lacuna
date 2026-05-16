@@ -7,6 +7,10 @@
   "hooks": {
     "SessionStart": [
       {
+        "_comment": "Refuse to start if scan_kind and .mcp.json disagree, or if a DAST scan is missing allowed_hosts.",
+        "command": "python3 -m lacuna.hooks.pre_session_validate"
+      },
+      {
         "command": "python3 -m lacuna.hooks.session_start"
       }
     ],

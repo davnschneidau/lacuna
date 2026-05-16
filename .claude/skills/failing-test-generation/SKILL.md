@@ -1,6 +1,10 @@
 ---
 name: failing-test-generation
 description: After a finding is confirmed, generate a failing unit/integration test that demonstrates the vulnerability and will pass once the patch is applied. Use after patch-suggestion to produce a complete fix package.
+when_to_use:
+  - A finding has been confirmed and patch-suggestion produced a candidate diff.
+  - The remediation package needs a regression test before being handed to developers.
+  - You are preparing fix-PR artefacts (Phase 8) and need executable proof of the bug.
 ---
 
 # Failing test generation

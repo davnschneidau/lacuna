@@ -4,6 +4,10 @@ description: |
   Per-type boundary sets for generating "what would make this function
   behave surprisingly?" inputs. Use whenever staring at a function and
   wondering what to try. The boundary set is the bug surface.
+when_to_use:
+  - You are reading a function and need a candidate input to test a hypothesis.
+  - Validator is drafting a PoC and the obvious payload did not trigger the bug.
+  - Fuzzing-coordinator is choosing seeds for a coverage-guided run.
 ---
 
 # Interesting Input

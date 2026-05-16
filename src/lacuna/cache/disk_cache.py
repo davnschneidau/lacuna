@@ -14,7 +14,6 @@ Tools that are safe to cache (deterministic given same git_sha):
 """
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 import os
@@ -22,7 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 _INSTANCE: DiskCache | None = None
@@ -86,27 +85,6 @@ class DiskCache:
             return
         self._maybe_evict()
 
-    def invalidate(self, key: str) -> None:
-        self._path(key).unlink(missing_ok=True)
-
-    def clear(self) -> int:
-        """Delete all cache entries. Returns count deleted."""
-        count = 0
-        for p in self._root.glob("*.json"):
-            p.unlink(missing_ok=True)
-            count += 1
-        return count
-
-    def stats(self) -> dict:
-        entries = list(self._root.glob("*.json"))
-        total_bytes = sum(p.stat().st_size for p in entries if p.exists())
-        return {
-            "entries": len(entries),
-            "size_mb": round(total_bytes / 1024 ** 2, 1),
-            "cache_dir": str(self._root),
-            "ttl_days": self._ttl_s / 86400,
-        }
-
     # ------------------------------------------------------------------
     # Private
 
@@ -150,54 +128,6 @@ def git_sha_for(repo_path: Path) -> str:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return "unknown"
-
-
-# ---------------------------------------------------------------------------
-# Decorator
-
-def cached(
-    tool_name: str,
-    key_fn: Callable[..., tuple[str, str, dict]] | None = None,
-) -> Callable:
-    """
-    Decorator that wraps a recon tool function with disk caching.
-
-    The decorated function must accept ``repo_path`` as its first positional
-    arg (a Path) and ``repo_name`` as a keyword arg.
-
-    ``key_fn`` receives the same args as the function and must return
-    (repo_name, repo_path, extra_kwargs) for key construction.
-
-    Usage:
-        @cached("dependency_graph")
-        def _compute_dep_graph(repo_path: Path, repo_name: str) -> dict:
-            ...
-    """
-    def decorator(fn: Callable) -> Callable:
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            if os.environ.get("LACUNA_CACHE_DISABLED", "").lower() in ("1", "true", "yes"):
-                return fn(*args, **kwargs)
-            if key_fn is not None:
-                repo_name, repo_path, extra = key_fn(*args, **kwargs)
-            else:
-                repo_path = args[0] if args else kwargs.get("repo_path", Path("."))
-                repo_name = kwargs.get("repo_name", str(repo_path.name))
-                extra = {k: v for k, v in kwargs.items()
-                         if k not in ("repo_path", "repo_name")}
-
-            sha = git_sha_for(Path(repo_path))
-            key = cache_key(repo_name, tool_name, sha, **extra)
-            c = get_cache()
-            hit = c.get(key)
-            if hit is not None:
-                return hit
-            result = fn(*args, **kwargs)
-            c.put(key, result)
-            return result
-
-        return wrapper
-    return decorator
 
 
 def _warn(msg: str) -> None:

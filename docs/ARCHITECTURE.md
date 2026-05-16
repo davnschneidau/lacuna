@@ -23,7 +23,7 @@
 
 ## 2. High-level architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  HARNESS  (Docker container)                                             │
 │                                                                          │
@@ -65,9 +65,9 @@ Three things to internalize about this picture:
 
 ---
 
-## 3. The four phases (and how the orchestrator drives them)
+## 3. Scan flow (and how the orchestrator drives it)
 
-### Phase 1 — Recon (deterministic, parallel-safe)
+### Recon (deterministic, parallel-safe)
 The orchestrator spawns the `recon` subagent with the manifest. Recon's only job is to call deterministic tools and write a *Repo Map* and *Service Map* into the KG.
 
 Outputs into KG:
@@ -83,9 +83,9 @@ Outputs into KG:
 - `hotspot:*` — git churn / recently changed / low test coverage
 - `framework_caps:*` — for each framework, the well-known footguns
 
-Recon writes a one-page **Application Model** summary into the KG as its handoff to Phase 2. The main orchestrator only ever reads the summary — never the raw tool output.
+Recon writes a one-page **Application Model** summary into the KG as its handoff to the next stage. The main orchestrator only ever reads the summary — never the raw tool output.
 
-### Phase 2 — Hypothesize (semantic, parallel)
+### Hypothesize (semantic, parallel)
 Orchestrator reads the Application Model and spawns specialized **Vuln Hunter** subagents in parallel. Each is opinionated about a *shape of risk*, not a CWE. Example shapes:
 
 - **Trust-boundary smuggling** — input from source A reaches sink B without crossing a validated boundary
@@ -101,7 +101,7 @@ Each hunter writes **hypotheses** to the KG — explicit claims like *"endpoint 
 
 Crucially: hypotheses are not findings. They're claims awaiting validation.
 
-### Phase 3 — Validate (iterative, per-hypothesis)
+### Validate (iterative, per-hypothesis)
 For each hypothesis above some confidence threshold, the orchestrator spawns a **Validator** subagent with a tight remit: confirm or refute *this one claim*.
 
 The validator runs a **red/blue dialectic** in a single context:
@@ -111,7 +111,7 @@ The validator runs a **red/blue dialectic** in a single context:
 
 This loop is *bounded by rounds*, not tokens. Default: up to 4 rounds per hypothesis. The validator's job is to be honest about uncertainty.
 
-### Phase 4 — Chain & Report
+### Chain & Report
 Every confirmed finding contributes one or more **primitives** to the KG. A primitive is an exploitable capability described in adversary terms:
 
 > *"In `wallet` service, an authenticated user can cause arbitrary HTTP requests to be issued from the service's network position (SSRF via `webhook_url`). Requirement: any authenticated session. Yields: requests originate from inside the VPC."*
@@ -193,7 +193,7 @@ This manifest is the single input to the scanner. Bitbucket Cloud credentials/SS
 
 ## 5. Directory layout (the actual repo you'll be building)
 
-```
+```text
 lacuna/
 ├── Dockerfile
 ├── README.md
@@ -248,15 +248,7 @@ lacuna/
 │   │   ├── hunter-cross-service.md
 │   │   ├── validator.md
 │   │   └── chain-builder.md
-│   ├── skills/
-│   │   ├── caveman/SKILL.md
-│   │   ├── semantic-pattern-matching/SKILL.md
-│   │   ├── red-blue-dialectic/SKILL.md
-│   │   ├── primitive-extraction/SKILL.md
-│   │   ├── chain-construction/SKILL.md
-│   │   ├── poc-drafting/SKILL.md
-│   │   ├── report-exec/SKILL.md
-│   │   └── report-tech/SKILL.md
+│   ├── skills/                # See .claude/skills/ for the live set
 │   └── commands/
 │       ├── kickoff.md
 │       ├── status.md
@@ -293,15 +285,15 @@ You are NOT a chatbot. You are a long-running autonomous agent.
 5. **You may not stop** until the KG reports `exit_criteria_met = true`. The
    Stop hook will reject your termination otherwise.
 
-## Phase sequencing
-Phase 1: spawn `recon`. Wait for `application_model_ready` in KG.
-Phase 2: read the Application Model. For each shape-of-risk that applies to
-         this application, spawn the matching `hunter-*` subagent in parallel.
-Phase 3: as hypotheses appear in KG, spawn `validator` per hypothesis above
-         confidence 0.3. The `chain-builder` subagent runs continuously from
-         the moment the first finding is recorded.
-Phase 4: when `all_hypotheses_resolved` and `chain_search_exhausted` are true,
-         invoke skills `report-exec` and `report-tech`. Then stop.
+## Sequencing
+1. Spawn `recon`. Wait for `application_model_ready` in KG.
+2. Read the Application Model. For each shape-of-risk that applies to
+   this application, spawn the matching `hunter-*` subagent in parallel.
+3. As hypotheses appear in KG, spawn `validator` per hypothesis above
+   confidence 0.3. The `chain-builder` subagent runs continuously from
+   the moment the first finding is recorded.
+4. When `all_hypotheses_resolved` and `chain_search_exhausted` are true,
+   invoke skills `report-exec` and `report-tech`. Then stop.
 
 ## Tooling rules
 - Use `lacuna-recon` for any structural question about a repo.
@@ -320,22 +312,22 @@ Spawn a subagent. Ask the KG. Write down what you think and why. Then test it.
 
 Subagents live in `.claude/agents/*.md` with YAML frontmatter. Every one of them shares two things: a model preference and a tools list.
 
-**Auto model selection** — set via the `model:` frontmatter field per agent. Claude Code will route to the model declared (Opus / Sonnet / Haiku / `auto`). Through Azure Foundry, this maps to the corresponding Foundry deployment.
+**Auto model selection** — set via the `model:` frontmatter field per agent (each agent's `.md` file is the source of truth; do not duplicate the assignment here). Claude Code will route to the model declared. Through Azure Foundry, this maps to the corresponding Foundry deployment.
 
-| Agent | Model | Why | Key tools |
-|---|---|---|---|
-| `recon` | sonnet | Tool-heavy, low reasoning depth, big I/O | `lacuna-recon.*`, `lacuna-kg.write` |
-| `hunter-injection` | opus | Trace data flow across files | `lacuna-recon.taint_paths`, `lacuna-recon.code_excerpt`, `lacuna-kg.*` |
-| `hunter-authn-authz` | opus | Deep cross-service reasoning | `lacuna-recon.auth_surface`, `.authz_checks`, `.endpoints`, KG |
-| `hunter-race-toctou` | opus | Subtle concurrency reasoning | `lacuna-recon.ast_query`, KG |
-| `hunter-deserialization` | opus | High-stakes, low false-positive tolerance | full recon + KG |
-| `hunter-memory` | opus | Only spawned for C/C++/Rust-unsafe code | full recon + KG |
-| `hunter-crypto` | sonnet | Mostly pattern-matching against known misuse | `crypto_usage`, KG |
-| `hunter-business-logic` | opus | Hardest — needs to infer invariants | recon + DB schema + API surface + KG |
-| `hunter-cross-service` | opus | Reasons across repo boundaries | `service_map`, `cross_repo_calls`, KG |
-| `validator` | opus | Red/blue dialectic, must be honest about uncertainty | full toolset, including DAST if enabled |
-| `chain-builder` | opus | Combinatorial reasoning over primitives | KG only — no code access needed |
-| `triage-classifier` | haiku | Bulk severity tagging | KG read only |
+| Agent | Why | Key tools |
+|---|---|---|
+| `recon` | Tool-heavy, low reasoning depth, big I/O | `lacuna-recon.*`, `lacuna-kg.write` |
+| `hunter-injection` | Trace data flow across files | `lacuna-recon.taint_paths`, `lacuna-recon.code_excerpt`, `lacuna-kg.*` |
+| `hunter-authn-authz` | Deep cross-service reasoning | `lacuna-recon.auth_surface`, `.authz_checks`, `.endpoints`, KG |
+| `hunter-race-toctou` | Subtle concurrency reasoning | `lacuna-recon.ast_query`, KG |
+| `hunter-deserialization` | High-stakes, low false-positive tolerance | full recon + KG |
+| `hunter-memory` | Only spawned for C/C++/Rust-unsafe code | full recon + KG |
+| `hunter-crypto` | Mostly pattern-matching against known misuse | `crypto_usage`, KG |
+| `hunter-business-logic` | Hardest — needs to infer invariants | recon + DB schema + API surface + KG |
+| `hunter-cross-service` | Reasons across repo boundaries | `service_map`, `cross_repo_calls`, KG |
+| `validator` | Red/blue dialectic, must be honest about uncertainty | full toolset, including DAST if enabled |
+| `chain-builder` | Combinatorial reasoning over primitives | KG only — no code access needed |
+| `triage-classifier` | Bulk severity tagging | KG read only |
 
 Example agent file (`hunter-cross-service.md`):
 
@@ -644,7 +636,7 @@ This is the hardest part to get right; spelling out exactly how each Mythos beha
 | **Server-side compaction** | Claude Code's built-in compaction + Lacuna's `PreCompact` hook that flushes in-flight reasoning to the KG before context is summarized. After compaction the agent re-reads from the KG, not the lossy summary. |
 | **Context editing (forgetting stale tool results)** | Aggressive subagent usage. The verbose output of `recon` never reaches the orchestrator's context — only the Application Model summary does. Same for every hunter. Subagent isolation *is* context editing. |
 | **Long-running agent workflows without overload** | The Stop hook + KG durability mean a scan can run for hours across many compactions. Even if every transcript byte is summarized away, the KG carries forward everything that matters. |
-| **Hypothesis-driven exploration** | Phase 2's hypothesis-first design. The agent never just "reads code looking for bugs" — it forms a claim, then tests it. |
+| **Hypothesis-driven exploration** | The hypothesis-first design of the hunter stage. The agent never just "reads code looking for bugs" — it forms a claim, then tests it. |
 | **Iterative test-retry-validate** | The validator's red/blue dialectic, bounded by *rounds* not tokens. The Stop hook continues the orchestrator until all hypotheses reach a terminal state. |
 | **Semantic matching** | Hunters specialize by *shape of risk*, not CWE. The `semantic-pattern-matching` skill gives them the shapes. Tree-sitter / semgrep-class queries do the syntactic heavy lifting beneath. |
 | **Exploit chaining** | Explicit first-class entity in the schema; `chain-builder` subagent runs continuously. |
@@ -715,7 +707,7 @@ ENTRYPOINT ["/opt/lacuna/pipe.sh"]
 `bitbucket-pipe/pipe.yml`:
 ```yaml
 name: Lacuna Security Scanner
-image: acme/lacuna:3.0.0
+image: acme/lacuna:3.1.1
 description: Application-level agentic security scanner
 variables:
   - name: LACUNA_MANIFEST
@@ -742,7 +734,7 @@ pipelines:
           name: Lacuna application scan
           services: [docker]
           script:
-            - pipe: docker://acme/lacuna:3.0.0
+            - pipe: docker://acme/lacuna:3.1.1
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'
@@ -777,7 +769,7 @@ docker run --rm \
   -e AZURE_FOUNDRY_ENDPOINT=... \
   -e AZURE_FOUNDRY_KEY=... \
   -e BITBUCKET_APP_PASSWORD=... \
-  acme/lacuna:3.0.0 \
+  acme/lacuna:3.1.1 \
   scan --manifest /workspace/app.lacuna.yaml --mode sast
 ```
 
@@ -817,7 +809,7 @@ Pulling out the four most important architectural choices that make this Mythos-
 
 1. **The KG is the agent, the LLM is the worker.** Mythos's "context compaction" is really "the long-term memory isn't the transcript." Same here: agents come and go, the KG persists. This single decision is what makes long-running, self-recovering, exploit-chaining scans possible.
 
-2. **Hypotheses are the unit of work, not findings.** Mythos doesn't "scan and report" — it *poses and tests*. Phase 2/3 in this architecture mirrors that: speculation is cheap, validation is rigorous, and refuted hypotheses are evidence of work done, not waste.
+2. **Hypotheses are the unit of work, not findings.** Mythos doesn't "scan and report" — it *poses and tests*. The hunter/validator stages mirror that: speculation is cheap, validation is rigorous, and refuted hypotheses are evidence of work done, not waste.
 
 3. **Primitives + chains beat severities.** A SAST tool reports 200 mediums and one false-positive critical. Lacuna reports five primitives and the two chains that compose them into account takeover. The composition layer is the value.
 

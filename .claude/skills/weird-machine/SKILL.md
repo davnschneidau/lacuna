@@ -1,6 +1,10 @@
 ---
 name: weird-machine
 description: Think laterally about what computation each primitive enables beyond its intended use. Use during chain-construction whenever you have 2+ primitives and want to discover unintended compositions.
+when_to_use:
+  - Chain-builder has two or more primitives and is searching for unintended compositions.
+  - You notice a primitive whose declared effect understates its real attacker value.
+  - A finding's chain feels too obvious and you suspect a deeper composition.
 ---
 
 # The Weird Machine

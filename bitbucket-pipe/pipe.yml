@@ -1,7 +1,8 @@
 name: Lacuna Security Scanner
-# Bump this tag in lock-step with src/lacuna/__init__.py. CI verifies the two
-# are identical.
-image: lacuna:3.0.0
+# Bump this tag in lock-step with src/lacuna/__init__.py. The release
+# CI workflow (and scripts/lint_versions.py locally) verify the two are
+# identical and fail the build if they drift.
+image: lacuna:3.1.1
 description: Agentic, application-level security scanner. SAST and DAST for multi-repo applications, powered by Claude Code through Azure Foundry.
 # Replace <your-workspace> with the Bitbucket workspace slug that hosts your
 # fork of the pipe before publishing.
@@ -20,11 +21,41 @@ variables:
     default: "app.lacuna.yaml"
 
   - name: LACUNA_MODE
-    description: Scan mode — sast (default) or sast+dast.
+    description: |
+      Legacy scan mode selector. Translated into LACUNA_SCAN_KIND /
+      LACUNA_SCAN_SCOPE at runtime by lacuna.kind.parse_legacy_mode.
+      Operators are encouraged to set LACUNA_SCAN_KIND and
+      LACUNA_SCAN_SCOPE directly; LACUNA_MODE is kept for back-compat
+      with existing pipelines.
     default: "sast"
     allowed-values:
       - "sast"
       - "sast+dast"
+      - "diff"
+      - "diff-sast+dast"
+
+  - name: LACUNA_SCAN_KIND
+    description: |
+      Scan-kind selector. ``sast`` registers only the static MCP
+      servers; ``sast_dast`` additionally registers ``lacuna-dast``
+      and recruits the DAST-capable agents declared in
+      ``.claude/topology.yaml``. Overrides LACUNA_MODE when set.
+    default: ""
+    allowed-values:
+      - ""
+      - "sast"
+      - "sast_dast"
+
+  - name: LACUNA_SCAN_SCOPE
+    description: |
+      Scan-scope selector. ``full`` scans every repo declared in the
+      manifest; ``diff`` scans only the files in the diff and their
+      transitive imports.
+    default: ""
+    allowed-values:
+      - ""
+      - "full"
+      - "diff"
 
   - name: LACUNA_FAIL_ON
     description: Severity threshold that causes a non-zero exit code.

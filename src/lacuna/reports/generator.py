@@ -146,10 +146,24 @@ def _exec_context(kg) -> dict[str, Any]:
 
     repo_names = ", ".join(r for r in repos if isinstance(r, str)) or "(see manifest)"
 
+    scan_kind = kg.get_meta("scan_kind") or "sast"
+    scan_scope = kg.get_meta("scan_scope") or "full"
+    scan_mode = kg.get_meta("scan_mode") or "sast"
     return {
         "app_name": app_name,
         "scan_date": time.strftime("%Y-%m-%d"),
-        "scan_mode": kg.get_meta("scan_mode") or "sast",
+        "scan_mode": scan_mode,
+        "scan_kind": scan_kind,
+        "scan_scope": scan_scope,
+        "scan_kind_human": (
+            "SAST + DAST (static + dynamic)"
+            if scan_kind == "sast_dast"
+            else "SAST (static analysis only)"
+        ),
+        "scan_scope_human": (
+            "diff-scoped (changed files + transitive imports)"
+            if scan_scope == "diff" else "full repository"
+        ),
         "repo_count": len(repos),
         "repo_names": repo_names,
         "scan_duration": _format_duration(
@@ -269,6 +283,8 @@ def _tech_context(kg) -> dict[str, Any]:
         ],
         "weird_compositions": kg.list_weird_compositions(),
         "skeptic_reviews": _collect_skeptic_reviews(kg),
+        "adversary_verdicts": _collect_adversary_verdicts(kg),
+        "refuted_appendix": _collect_refuted_findings(kg, findings_full),
         "observations": [
             {
                 "kind": o["kind"], "summary": o["summary"],
@@ -362,19 +378,63 @@ def _collect_crash_reproductions(
 
 
 def _collect_incomplete_fixes(kg, all_hyps: list[dict]) -> list[dict]:
-    """Hypotheses whose source_hunter was patch-archaeologist."""
+    """Hypotheses raised by ``patch-archaeologist`` as "incomplete fix".
+
+    History: an earlier implementation read three columns --
+    ``source_hunter``, ``parent_finding_id``, ``cwe`` -- from the
+    ``hypotheses`` table. None of them exist in the live schema
+    (``src/lacuna/kg/schema.sql``), so the collector silently returned an
+    empty list and the "Incomplete Fixes" section of every report was
+    permanently blank.
+
+    Today we:
+
+    1. Match on the real ``hunter`` column (not the non-existent
+       ``source_hunter``).
+    2. Look up per-hypothesis metadata (``parent_commit``, ``cwe``) from
+       ``event_log`` events of type ``incomplete_fix_metadata`` that the
+       patch-archaeologist agent emits alongside the draft. When the
+       event is missing (older scans, or before the agent prompt is
+       updated), the collector still surfaces the hypothesis with ``?``
+       placeholders rather than swallowing it.
+    """
     out: list[dict] = []
+    if not all_hyps:
+        return out
+    metadata_by_hyp = _patch_archaeologist_metadata(kg)
     for h in all_hyps:
-        if h.get("source_hunter") not in ("patch-archaeologist",):
+        if (h.get("hunter") or "") != "patch-archaeologist":
             continue
+        meta = metadata_by_hyp.get(h["id"], {})
+        parent_commit = (
+            meta.get("parent_commit")
+            or meta.get("parent_finding_id")
+            or "?"
+        )
         out.append({
             "hyp_id": h["id"],
             "location": f"{h.get('file', '?')}:{h.get('line', '?')}",
-            "parent_commit_short": (h.get("parent_finding_id") or "?")[:10],
-            "bug_class": h.get("cwe", "?"),
+            "parent_commit_short": (parent_commit or "?")[:10],
+            "bug_class": meta.get("cwe") or "?",
             "verdict": h.get("status"),
         })
     return out
+
+
+def _patch_archaeologist_metadata(kg) -> dict[str, dict]:
+    """Index ``incomplete_fix_metadata`` events by ``hyp_id``.
+
+    Patch-archaeologist is expected to emit one such event per draft
+    hypothesis so the reporter can associate the CWE and the parent
+    commit. Returns ``{}`` when no events exist (older scans).
+    """
+    by_id: dict[str, dict] = {}
+    for e in kg.recent_events(n=1000, event_type="incomplete_fix_metadata"):
+        payload = _parse_event_payload(e)
+        hyp_id = payload.get("hyp_id") or payload.get("hypothesis_id")
+        if hyp_id:
+            by_id[hyp_id] = payload
+    return by_id
 
 
 def _summarize_precision_findings(kg) -> list[dict]:
@@ -426,17 +486,140 @@ def _find_capability_name(kg, cap_id: str | None) -> str | None:
     return None
 
 
+_VERDICT_GLYPH = {
+    "confirmed": "[\u2713]",
+    "downgrade": "[\u25BC]",
+    "refuted": "[\u2717]",
+    "needs_human": "[?]",
+    "refute_pending": "[\u2026]",
+}
+
+
+def _verdict_glyph(verdict: str | None) -> str:
+    """Return a short, terminal-safe glyph for a verdict.
+
+    Used in the executive report and the SARIF emitter. ASCII-only so
+    Windows consoles don't barf.
+    """
+    if not verdict:
+        return "[ ]"
+    return _VERDICT_GLYPH.get(verdict, f"[{verdict[:3]}]")
+
+
+def _collect_adversary_verdicts(kg) -> list[dict]:
+    """Materialise adversary verdicts for the report template.
+
+    Returns one row per (finding, adversary) pair, with the verdict,
+    a short reasoning excerpt, and the glyph. The template groups by
+    ``finding_id`` if it wants the per-finding two-adversary delta.
+    """
+    out: list[dict] = []
+    try:
+        rows = kg.list_adversary_verdicts()
+    except Exception:
+        return out
+    for r in rows:
+        out.append({
+            "finding_id": r.get("finding_id"),
+            "adversary": r.get("adversary"),
+            "verdict": r.get("verdict"),
+            "glyph": _verdict_glyph(r.get("verdict")),
+            "reasoning": (r.get("reasoning") or "")[:240],
+            "argument_against": (r.get("argument_against") or "")[:240],
+        })
+    return out
+
+
+def _collect_refuted_findings(kg, findings_full: list[dict]) -> list[dict]:
+    """Findings whose verdicts ended in ``refuted`` or ``refute_pending``.
+
+    These don't appear in the main catalog (the validator's confirmed
+    finding has been refuted by the adversary) but they belong in an
+    appendix so the analyst can see the disagreement.
+    """
+    by_id: dict[str, dict] = {}
+    try:
+        verdicts = kg.list_adversary_verdicts()
+    except Exception:
+        return []
+    for v in verdicts:
+        if v.get("verdict") in ("refuted", "refute_pending"):
+            fid = v.get("finding_id")
+            if not fid:
+                continue
+            by_id.setdefault(fid, {
+                "finding_id": fid,
+                "verdicts": [],
+            })["verdicts"].append({
+                "adversary": v.get("adversary"),
+                "verdict": v.get("verdict"),
+                "glyph": _verdict_glyph(v.get("verdict")),
+                "reasoning": (v.get("reasoning") or "")[:240],
+            })
+
+    findings_by_id = {f["id"]: f for f in findings_full}
+    out: list[dict] = []
+    for fid, row in by_id.items():
+        f = findings_by_id.get(fid, {})
+        out.append({
+            **row,
+            "title": f.get("title", fid),
+            "severity": f.get("severity", "?"),
+        })
+    return out
+
+
 def _collect_skeptic_reviews(kg) -> list[dict]:
-    """Pull skeptic reviews from the events stream."""
-    out = []
+    """Pull skeptic reviews from the events stream.
+
+    History: the original implementation called ``e.get("payload")``
+    -- but ``KG.recent_events`` returns rows from the ``event_log``
+    table where the payload column is named ``payload_json`` and is a
+    JSON *string*, not an already-deserialised dict. The dict-style
+    access silently returned ``None`` for every event, so the
+    "Skeptic Reviews" section of every report was permanently empty.
+    The fix uses ``_parse_event_payload`` to handle both legacy dict
+    payloads and the canonical JSON-string format defensively.
+    """
+    out: list[dict] = []
     for e in kg.recent_events(n=500, event_type="skeptic_review"):
-        p = e.get("payload") or {}
+        p = _parse_event_payload(e)
         out.append({
             "finding_id": p.get("finding_id"),
             "verdict": p.get("verdict"),
             "notes": (p.get("reasoning") or "")[:120],
         })
     return out
+
+
+def _parse_event_payload(e: dict) -> dict:
+    """Return the event payload as a dict regardless of column shape.
+
+    ``KG.recent_events`` returns rows from ``event_log``. The canonical
+    column is ``payload_json`` (TEXT, stringified JSON). Older code
+    paths and a few tests passed a pre-deserialised ``payload`` dict
+    directly; we honour both to avoid the report breaking on either.
+    Anything we can't parse is logged-by-omission (return ``{}``)
+    rather than raising — the reporter must not crash on a single bad
+    event.
+    """
+    raw = e.get("payload_json")
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    raw_obj = e.get("payload")
+    if isinstance(raw_obj, dict):
+        return raw_obj
+    if isinstance(raw_obj, str) and raw_obj:
+        try:
+            parsed = json.loads(raw_obj)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def write_reports(reports_dir: Path) -> None:

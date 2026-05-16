@@ -133,8 +133,44 @@ def _allowed_hosts() -> list[str]:
     return _dast_config().get("target", {}).get("allowed_hosts", []) or []
 
 
+def _kind_guard() -> str | None:
+    """Refuse to act when the scan is not a DAST scan.
+
+    The DAST MCP server must not activate if the surrounding scan is
+    SAST-only. We check the canonical ``LACUNA_MODE`` env (and the
+    optional ``LACUNA_SCAN_KIND`` override) on every tool call so an
+    operator can't accidentally bypass the gate by launching the
+    server in the wrong context.
+
+    Tests that exercise the DAST server in isolation can set
+    ``LACUNA_DAST_KIND_GUARD=0`` to opt out of the runtime gate.
+    """
+    if os.environ.get("LACUNA_DAST_KIND_GUARD", "1") == "0":
+        return None
+    from lacuna.kind import parse_legacy_mode
+    spec = parse_legacy_mode(os.environ.get("LACUNA_MODE", "sast"))
+    if not spec.supports_dast_tools:
+        return (
+            f"lacuna-dast tools are not available in scan_kind="
+            f"{spec.kind.value} (LACUNA_MODE="
+            f"{os.environ.get('LACUNA_MODE')!r}). Re-launch with "
+            f"LACUNA_MODE=sast+dast to enable DAST."
+        )
+    return None
+
+
 def _check_target(url: str) -> str | None:
-    """Return None if target is allowed; an error string otherwise."""
+    """Return None if target is allowed; an error string otherwise.
+
+    Composition: every entry point first calls ``_kind_guard`` (so a
+    mis-launched DAST server fails fast), then validates the URL
+    against the manifest allowlist. The order matters — the kind
+    check is the architectural separation gate; the allowlist is the
+    target-scope gate.
+    """
+    kind_err = _kind_guard()
+    if kind_err:
+        return kind_err
     if not url.startswith(("http://", "https://")):
         return f"invalid URL scheme: {url}"
     allowed = _allowed_hosts()
@@ -577,6 +613,15 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    # Top-level kind guard -- refuses every DAST tool when the scan is
+    # SAST-only. The same check fires inside ``_check_target`` for the
+    # tools that hit the network; this catches the OOB / oracle /
+    # introspection helpers that don't always hit ``_check_target`` so
+    # we get uniform separation regardless of which path the agent
+    # takes.
+    err = _kind_guard()
+    if err:
+        return _err(err)
     try:
         if name == "http_request":
             return await _t_http_request(arguments)

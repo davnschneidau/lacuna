@@ -7,7 +7,6 @@ Public API:
   reachable(cg, source_fn, target_fn) -> (bool, [path])
   callers(cg, fn, transitive=True) -> set[str]
   taint_paths(cg) -> [TaintHit]
-  taint_paths_for(cg, fn_qualname) -> [TaintHit]
 
 The engine produces results that recon tools can serialize for the KG and
 that the validator can use to refute or confirm hypotheses with much higher
@@ -41,12 +40,6 @@ def taint_paths(cg: CallGraph, max_depth: int = 6) -> list[TaintHit]:
     return TaintAnalyzer(cg, max_depth=max_depth).analyze()
 
 
-def taint_paths_for(
-    cg: CallGraph, fn_qualname: str, max_depth: int = 6,
-) -> list[TaintHit]:
-    return TaintAnalyzer(cg, max_depth=max_depth).analyze_function_by_name(fn_qualname)
-
-
 __all__ = [
     "CallGraph",
     "CallSite",
@@ -60,5 +53,4 @@ __all__ = [
     "parse_with_tree_sitter",
     "reachable",
     "taint_paths",
-    "taint_paths_for",
 ]

@@ -5,6 +5,10 @@ description: |
   is a capability-with-prerequisites-and-effects. Primitives are the unit
   of composition for the chain-builder; their quality determines whether
   chains are discovered.
+when_to_use:
+  - Validator confirmed a finding and must record its primitives in the KG.
+  - You are reviewing a finding whose primitive list is empty or vague.
+  - Chain-builder is failing to compose chains and the primitives may be underspecified.
 ---
 
 # Primitive extraction
@@ -15,7 +19,7 @@ humans; primitives are reasoned over by the chain-builder.
 
 ## The shape of a primitive
 
-```
+```text
 name: short, action-oriented (verb-object)
 description: 1-2 sentences in plain English
 prerequisites: list of canonical states required to use this primitive
@@ -71,7 +75,7 @@ to fetch arbitrary URLs.
 
 **Primitives:**
 
-```
+```yaml
 P1:
   name: SSRF via image-proxy URL parameter
   description: Image-proxy fetches attacker-supplied URL and returns body.
@@ -89,7 +93,7 @@ input for the chain-builder.
 
 **Primitives:**
 
-```
+```yaml
 P2:
   name: Forge JWT for arbitrary user
   description: HMAC signing key is in source; any actor with read access to

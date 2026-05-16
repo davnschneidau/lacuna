@@ -27,7 +27,7 @@ Lacuna inherits all five mechanisms and both patterns. The rest of this document
 
 ## Part 2 — Lacuna's five-tier context model
 
-```
+```text
                   attention budget
                        ▲
                        │  ████  Tier 1: System prompt + skills (small, durable)
@@ -266,7 +266,7 @@ Anthropic's memory tool is a file-based interface. Lacuna exposes the KG *both* 
 
 The memory tool sees a virtual directory layout:
 
-```
+```text
 /memory/
 ├── application_model.md              ← read-only, written by recon
 ├── current_phase.md                  ← read-only, written by orchestrator
@@ -301,40 +301,11 @@ CREATE TABLE agent_notes (
 
 **Why both interfaces?** Different access patterns. The orchestrator's planning logic benefits from structured queries (`kg.read.hypotheses(status='pending')`); the chain-builder's exploratory reasoning benefits from "open the file, scribble in it" semantics. Both routes hit the same SQLite DB.
 
-### 4.5 Sub-agent architecture — explicit context contracts
+### 4.5 Sub-agent architecture — informational contracts in agent frontmatter
 
-Every subagent has a written input and output contract enforced by the harness. The contract is the boundary across which context isolation actually happens.
+Every subagent has a written input/output description in its `.claude/agents/<name>.md` frontmatter and prose. These are informational guidance for the agent, not harness-enforced wrappers. The boundary across which context isolation actually happens is the subagent process boundary itself: the parent only ever sees the explicit summary the child returns.
 
-Example — `hunter-cross-service` contract:
-
-```yaml
-# .claude/agents/hunter-cross-service.contract.yaml
-input:
-  required:
-    - kg.application_model           # Always pre-loaded into Tier 2
-    - kg.service_map
-    - kg.cross_repo_calls
-  on_demand:                          # Subagent fetches as needed
-    - lacuna-recon.code_excerpt
-    - lacuna-recon.auth_surface
-    - lacuna-recon.endpoints
-    - kg.read.*
-  max_input_tokens: 8000              # Hard cap on Tier 1+2 at spawn
-
-output:
-  format: structured_markdown
-  required_sections:
-    - summary                          # ≤ 300 words
-    - hypotheses_added                 # ≤ 50 (each one in KG, just IDs here)
-    - notes_for_orchestrator           # ≤ 200 words, actionable only
-  max_output_tokens: 2000              # Hard cap on what returns to parent
-  forbidden:
-    - raw_code_excerpts                # No code returns to parent
-    - tool_output_dumps
-    - chain_of_thought                 # Stays in subagent's context
-```
-
-The harness enforces these caps by wrapping the subagent spawn. If a subagent tries to return 8K tokens of code, it gets truncated and the agent is asked to re-summarize — the parent's context window is sacred.
+`hunter-cross-service.md`, for example, declares which `kg.read.*` and `lacuna-recon.*` tools it should use, what its summary should contain, and what it must not echo back (raw code excerpts, tool output dumps, chain of thought). The agent honors those caps because it is told to; the orchestrator's window stays clean because subagents fan out into their own contexts.
 
 ### 4.6 Just-in-time retrieval — tools return handles, not contents
 
@@ -428,7 +399,7 @@ The validator is the most context-intensive single agent in the system, because 
 
 The dialectic is bounded by **rounds, not tokens**:
 
-```
+```text
 Round 1 — RED (attack)
   Tool calls: pull relevant code, trace data flow, draft PoC
   Output: <red-argument round="1"> ... </red-argument>
@@ -573,7 +544,7 @@ Pulling everything together with one finding's complete journey. This is the can
 **Birth (Phase 2, in `hunter-cross-service`)**
 The hunter reads `service_map` and notices `billing-svc` exposes a `/internal/refund` endpoint with no authentication. It reads `iac_scan` and sees billing-svc has a NodePort exposing it on the cluster network. It reads `endpoints` on `wallet-api` and finds a `POST /webhook` handler that takes a `callback_url` parameter and issues an HTTP request to it. It writes:
 
-```
+```xml
 <hypothesis-draft>
 {
   "shape": "cross-service-trust-via-network-position",
@@ -601,7 +572,7 @@ Orchestrator sees the new hypothesis via `kg.read.hypotheses(status='pending', m
 
 **Confirmation and primitive extraction (Validator)**
 
-```
+```xml
 <hypothesis-result status="confirmed" id="hyp-7f2a1c">
   <evidence>
     <kind>http_trace</kind>
@@ -624,7 +595,7 @@ Validator returns a 1.2K-token summary to the orchestrator. The orchestrator's c
 **Chain composition (Chain-builder, asynchronously)**
 The chain-builder has been polling the primitive ledger. The new primitive arrives. It searches for chains. It already has a primitive: `refund_creation_uncapped_by_account_status` (from an earlier billing-svc bug — billing trusts incoming refund requests blindly). Composition:
 
-```
+```text
 1. ssrf-to-internal-refund-via-wallet-webhook
    prereqs: authenticated wallet user
    effects: uncapped_refund_creation
@@ -652,13 +623,13 @@ The `report-tech` skill picks up the finding with its evidence path, the primiti
 
 Where each mechanism lives, in the repo layout from the main architecture doc:
 
-```
+```text
 .claude/
 ├── settings.json                     ← compaction prompt, tool-result-clearing config
 ├── CLAUDE.md                          ← Tier-1 system prompt
 ├── agents/
 │   ├── recon.md
-│   ├── hunter-*.md                    ← each with contract.yaml sibling
+│   ├── hunter-*.md
 │   ├── validator.md                   ← red/blue dialectic skill loaded
 │   └── chain-builder.md               ← chain-construction skill loaded
 ├── skills/
@@ -690,12 +661,10 @@ src/lacuna/
 │   └── memory_adapter.py             ← exposes KG as memory-tool file interface (Part 4.4)
 ├── tools/
 │   ├── recon_server.py               ← summary+facets+handles tool result shape (Part 4.6)
-│   ├── recon_payload_cache.py        ← /state/tool_results/ off-context payload store (Part 9.5)
 │   ├── kg_server.py
 │   └── dast_server.py
 └── harness/
-    ├── subagent_spawn.py             ← enforces input/output contracts (Part 4.5)
-    └── api_client.py                 ← injects context_management on every API call (Part 4.3)
+    └── workspace.py                  ← scan orchestration, child env whitelist
 ```
 
 ---

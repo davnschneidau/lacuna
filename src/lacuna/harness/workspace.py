@@ -29,6 +29,7 @@ from pathlib import Path
 import yaml
 
 from ..kg import open_kg
+from ..kind import ScanKindSpec, parse_legacy_mode
 from ..reports.generator import write_reports
 
 # Environment variables that must be passed through to the child agent
@@ -219,52 +220,76 @@ def _build_child_env(workspace: Path, extras: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def _write_mcp_config(workspace: Path) -> None:
-    """Drop .mcp.json into the workspace so Claude Code picks up the three MCP servers."""
+def _write_mcp_config(workspace: Path, spec: ScanKindSpec | None = None) -> None:
+    """Drop .mcp.json into the workspace tuned to the scan kind.
+
+    Historically the harness unconditionally registered ``lacuna-dast``
+    regardless of mode, which let the orchestrator (or any hunter) see
+    DAST tool names and call them even when the surrounding scan was
+    SAST-only. The PreToolUse hook refused the call, but only after
+    the agent had already wasted context tokens deciding to make it.
+
+    Fix: when ``spec`` is SAST-only, don't even advertise the DAST
+    server. The MCP client never learns about ``lacuna-dast.*`` tool
+    names, so they can't appear in the agent's tool catalog. When
+    ``spec`` is ``sast_dast``, advertise all three.
+    """
+    if spec is None:
+        spec = parse_legacy_mode(os.environ.get("LACUNA_MODE", "sast"))
+
     src_root = os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src")
-    mcp = {
-        "mcpServers": {
-            "lacuna-recon": {
-                "command": "python3",
-                "args": ["-m", "lacuna.tools.recon_server"],
-                "env": {
-                    "PYTHONPATH": src_root,
-                    "LACUNA_WORKSPACE": str(workspace),
-                    "LACUNA_MANIFEST_RESOLVED": os.environ.get(
-                        "LACUNA_MANIFEST_RESOLVED", ""
-                    ),
-                    "LACUNA_KG_PATH": os.environ.get("LACUNA_KG_PATH", ""),
-                    "LACUNA_TOOL_CACHE_DIR": os.environ.get(
-                        "LACUNA_TOOL_CACHE_DIR", ""
-                    ),
-                },
+    servers: dict[str, dict] = {
+        "lacuna-recon": {
+            "command": "python3",
+            "args": ["-m", "lacuna.tools.recon_server"],
+            "env": {
+                "PYTHONPATH": src_root,
+                "LACUNA_WORKSPACE": str(workspace),
+                "LACUNA_MANIFEST_RESOLVED": os.environ.get(
+                    "LACUNA_MANIFEST_RESOLVED", ""
+                ),
+                "LACUNA_KG_PATH": os.environ.get("LACUNA_KG_PATH", ""),
+                "LACUNA_TOOL_CACHE_DIR": os.environ.get(
+                    "LACUNA_TOOL_CACHE_DIR", ""
+                ),
+                "LACUNA_MODE": spec.legacy_mode_str,
+                "LACUNA_SCAN_KIND": spec.kind.value,
+                "LACUNA_SCAN_SCOPE": spec.scope.value,
             },
-            "lacuna-kg": {
-                "command": "python3",
-                "args": ["-m", "lacuna.tools.kg_server"],
-                "env": {
-                    "PYTHONPATH": src_root,
-                    "LACUNA_KG_PATH": os.environ.get("LACUNA_KG_PATH", ""),
-                },
+        },
+        "lacuna-kg": {
+            "command": "python3",
+            "args": ["-m", "lacuna.tools.kg_server"],
+            "env": {
+                "PYTHONPATH": src_root,
+                "LACUNA_KG_PATH": os.environ.get("LACUNA_KG_PATH", ""),
+                "LACUNA_SCAN_KIND": spec.kind.value,
+                "LACUNA_SCAN_SCOPE": spec.scope.value,
             },
-            "lacuna-dast": {
-                "command": "python3",
-                "args": ["-m", "lacuna.tools.dast_server"],
-                "env": {
-                    "PYTHONPATH": src_root,
-                    "LACUNA_WORKSPACE": str(workspace),
-                    "LACUNA_MANIFEST_RESOLVED": os.environ.get(
-                        "LACUNA_MANIFEST_RESOLVED", ""
-                    ),
-                    "LACUNA_KG_PATH": os.environ.get("LACUNA_KG_PATH", ""),
-                    "LACUNA_EVIDENCE_DIR": os.environ.get(
-                        "LACUNA_EVIDENCE_DIR", ""
-                    ),
-                },
+        },
+    }
+    if spec.supports_dast_tools:
+        servers["lacuna-dast"] = {
+            "command": "python3",
+            "args": ["-m", "lacuna.tools.dast_server"],
+            "env": {
+                "PYTHONPATH": src_root,
+                "LACUNA_WORKSPACE": str(workspace),
+                "LACUNA_MANIFEST_RESOLVED": os.environ.get(
+                    "LACUNA_MANIFEST_RESOLVED", ""
+                ),
+                "LACUNA_KG_PATH": os.environ.get("LACUNA_KG_PATH", ""),
+                "LACUNA_EVIDENCE_DIR": os.environ.get(
+                    "LACUNA_EVIDENCE_DIR", ""
+                ),
+                "LACUNA_MODE": spec.legacy_mode_str,
+                "LACUNA_SCAN_KIND": spec.kind.value,
+                "LACUNA_SCAN_SCOPE": spec.scope.value,
             },
         }
-    }
-    (workspace / ".mcp.json").write_text(json.dumps(mcp, indent=2))
+    (workspace / ".mcp.json").write_text(
+        json.dumps({"mcpServers": servers}, indent=2)
+    )
 
 
 def _stage_claude_config(workspace: Path) -> None:
@@ -316,15 +341,31 @@ def _resolve_wall_clock_hours(passed: float) -> float:
 
 
 def _track_budget_usd() -> float | None:
-    """Compute the spend-cap (USD) for this scan, or None if uncapped."""
+    """Compute the spend-cap (USD) for this scan, or None if uncapped.
+
+    Honesty notice. Enforcement happens *only* post-hoc -- at the end
+    of the scan -- by reading the ``token_cost_usd`` meta-key that no
+    agent currently writes. Until a real cost estimator lands
+    (per-call token sampling + pricing table), this knob is
+    informational. We log that fact loudly at scan start so operators
+    don't trust a number that nothing is actually checking.
+    """
     raw = os.environ.get("LACUNA_BUDGET_USD")
     if not raw:
         return None
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
-        _log(f"LACUNA_BUDGET_USD={raw!r} is not numeric — ignoring")
+        _log(f"LACUNA_BUDGET_USD={raw!r} is not numeric -- ignoring")
         return None
+    _log(
+        f"WARNING: LACUNA_BUDGET_USD=${value:.2f} is currently advisory. "
+        f"Token-cost accounting is not yet implemented; the budget is only "
+        f"checked at scan end against KG meta 'token_cost_usd', which the "
+        f"agents do not populate. Track spend at the Foundry console for "
+        f"the time being."
+    )
+    return value
 
 
 def run_scan(
@@ -342,14 +383,23 @@ def run_scan(
     os.environ["LACUNA_MANIFEST_RESOLVED"] = str(manifest_path)
     os.environ["LACUNA_MODE"] = mode
 
+    spec = parse_legacy_mode(mode)
+    os.environ["LACUNA_SCAN_KIND"] = spec.kind.value
+    os.environ["LACUNA_SCAN_SCOPE"] = spec.scope.value
+
     kg = open_kg()
     kg.initialize()
     kg.set_meta("scan_started_at", str(int(time.time())))
     kg.set_meta("scan_mode", mode)
+    kg.set_meta("scan_kind", spec.kind.value)
+    kg.set_meta("scan_scope", spec.scope.value)
     kg.set_meta("manifest_path", str(manifest_path))
     kg.set_meta("current_phase", "phase-0-init")
     kg.append_event("harness", "scan_started", {
-        "mode": mode, "manifest": str(manifest_path),
+        "mode": mode,
+        "scan_kind": spec.kind.value,
+        "scan_scope": spec.scope.value,
+        "manifest": str(manifest_path),
         "app": (manifest.get("application", {}) or {}).get("name"),
     })
     kg.close()
@@ -388,7 +438,7 @@ def run_scan(
             break
 
     _stage_claude_config(workspace)
-    _write_mcp_config(workspace)
+    _write_mcp_config(workspace, spec=spec)
 
     wall_clock_hours = _resolve_wall_clock_hours(wall_clock_hours)
     deadline_s = max(60, int(wall_clock_hours * 3600))
@@ -419,6 +469,22 @@ def run_scan(
     extra_env.update(diff_scope_envs)
     child_env = _build_child_env(workspace, extra_env)
 
+    # Security notice. ``--dangerously-skip-permissions`` disables the
+    # Claude Code interactive permission prompts. With it set, the
+    # *only* runtime gate between the agent and a destructive tool is
+    # our PreToolUse hook (``lacuna/hooks/pre_tool_use_gate.py``). The
+    # ``permissions.allowedTools`` block in ``.claude/settings.json``
+    # is decorative under this flag -- Claude Code does not enforce it
+    # when permissions are skipped. The hook is competent for SAST/DAST
+    # separation and rate limiting; it is NOT a substitute for runtime
+    # capability tokens, which we don't ship. Operators running in
+    # untrusted environments should remove the flag and accept the
+    # interactive prompts.
+    _log(
+        "WARNING: invoking `claude --dangerously-skip-permissions`. The "
+        "PreToolUse hook is the SOLE runtime gate; .claude/settings.json "
+        "permissions are advisory under this flag."
+    )
     cmd = [
         "claude",
         "-p", prompt,

@@ -1,6 +1,10 @@
 ---
 name: minimal-repro
 description: After a finding is confirmed, produce the SMALLEST input that still triggers it. Use during validator's post-confirmation phase; the stop hook will refuse to end the scan until every finding has a minimal repro recorded.
+when_to_use:
+  - Validator has just confirmed a finding with a working (but bloated) PoC.
+  - Stop hook is blocking scan completion because a finding lacks a minimal repro.
+  - You need a developer-friendly artefact attached to the technical report.
 ---
 
 # Minimal repro
@@ -72,7 +76,7 @@ Call `kg.write.minimal_repro` with:
 ## Worked example
 
 Starting confirming payload (1247 bytes):
-```
+```http
 POST /api/orders HTTP/1.1
 Host: target.local
 Authorization: Bearer eyJ...
@@ -92,7 +96,7 @@ X-Request-Id: 04f9c0a4-...
 ```
 
 After minimization:
-```
+```http
 POST /api/orders HTTP/1.1
 Host: target.local
 Authorization: Bearer <REDACTED>
@@ -102,7 +106,7 @@ Content-Type: application/json
 ```
 
 Minimization log:
-```
+```text
 - removed User-Agent / Accept / Accept-Encoding / X-Request-Id headers — bug still fires.
 - shrunk items[0] (removed options, removed items[1]) — still fires.
 - removed shipping_address entirely — still fires.

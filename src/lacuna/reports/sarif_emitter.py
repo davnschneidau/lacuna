@@ -146,6 +146,19 @@ def emit_sarif(kg: KG) -> dict[str, Any]:
     findings = kg.list_findings()
     chains = kg.list_chains()
 
+    # Attach adversary verdicts to each SARIF result so downstream
+    # ingesters (Bitbucket Pipelines, DefectDojo, Jira) can filter
+    # "show me only confirmed findings" vs "show me everything
+    # including refute_pending."
+    verdicts_by_finding: dict[str, list[dict]] = {}
+    try:
+        for v in kg.list_adversary_verdicts():
+            verdicts_by_finding.setdefault(
+                v["finding_id"], [],
+            ).append(v)
+    except Exception:
+        verdicts_by_finding = {}
+
     rules_by_id: dict[str, dict] = {}
     results: list[dict] = []
 
@@ -168,6 +181,8 @@ def emit_sarif(kg: KG) -> dict[str, Any]:
                 },
             }
         ev = kg.get_evidence(f["id"])
+        verdicts = verdicts_by_finding.get(f["id"], [])
+        adversary_summary = _summarize_verdicts(verdicts)
         results.append({
             "ruleId": rule_id,
             "level": SEVERITY_TO_SARIF.get(f["severity"], "warning"),
@@ -180,6 +195,14 @@ def emit_sarif(kg: KG) -> dict[str, Any]:
                 "lacuna_repos": _parse_repos(f),
                 "lacuna_evidence_paths": [e["payload_path"] for e in ev],
                 "lacuna_remediation_md": f.get("remediation_md"),
+                "lacuna_scan_kind": f.get("scan_kind"),
+                "lacuna_adversary_verdict": adversary_summary["consensus"],
+                "lacuna_adversary_verdicts": [
+                    {
+                        "adversary": v.get("adversary"),
+                        "verdict": v.get("verdict"),
+                    } for v in verdicts
+                ],
             },
             "locations": _evidence_locations(f, ev),
         })
@@ -245,3 +268,22 @@ def emit_sarif(kg: KG) -> dict[str, Any]:
 def _security_score(sev: str) -> str:
     return {"critical": "9.5", "high": "7.5",
              "medium": "5.0", "low": "2.0"}.get(sev, "0.0")
+
+
+def _summarize_verdicts(verdicts: list[dict]) -> dict[str, Any]:
+    """Reduce N adversary verdicts to a single SARIF-friendly summary.
+
+    - Empty: ``"refute_pending"`` (because that's the default until any
+      adversary runs).
+    - One verdict: that verdict.
+    - Multiple verdicts that agree: that verdict.
+    - Multiple verdicts that disagree: ``"needs_human"`` regardless of
+      which one was "right." (Two-adversary mode escalates disagreement
+      to a human reviewer rather than picking a winner.)
+    """
+    if not verdicts:
+        return {"consensus": "refute_pending"}
+    values = {v.get("verdict") for v in verdicts}
+    if len(values) == 1:
+        return {"consensus": next(iter(values))}
+    return {"consensus": "needs_human"}

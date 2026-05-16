@@ -4,6 +4,10 @@ description: |
   How to compose the technical report. Full per-finding template; refuted
   hypotheses included as audit trail; primitives and chains as separate
   sections. Reader is a security engineer or developer doing remediation.
+when_to_use:
+  - You are about to write or regenerate the technical report.
+  - A finding requires the full per-finding template (evidence, primitives, repro, patch).
+  - A reviewer asked why the refuted appendix is empty — re-read this skill.
 ---
 
 # Technical report style

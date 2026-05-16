@@ -4,6 +4,10 @@ description: |
   How to compose the executive report. Bottom-line-up-front; chains-first
   when present; non-technical attacker narrative; 3-5 prioritized fixes.
   Readers are non-technical stakeholders making resourcing decisions.
+when_to_use:
+  - You are about to write or regenerate the executive report.
+  - A scan finished and the orchestrator is invoking the report pass.
+  - You catch yourself writing CWE numbers in the exec narrative — re-read this skill.
 ---
 
 # Executive report style
@@ -13,7 +17,7 @@ paragraph, how worried they should be and what they should do.
 
 ## Structure
 
-```
+```markdown
 # Security Scan: {app_name}
 
 [metadata block: date, mode, repos]

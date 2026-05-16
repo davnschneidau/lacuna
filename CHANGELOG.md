@@ -1,5 +1,57 @@
 # Lacuna Changelog
 
+## 3.1.1 — 2026-05-16
+
+### Reconciliation release
+
+No functional changes. This release exists to reconcile drifting version
+declarations across the repo. Before 3.1.1:
+
+- `src/lacuna/__init__.py:__version__` said `3.0.0`.
+- `pyproject.toml` said `3.0.0`.
+- `bitbucket-pipe/pipe.yml` pinned `lacuna:3.0.0`.
+- README headline and CHANGELOG top entry said `3.1.0`.
+- `examples/bitbucket-pipelines.yml` referenced `3.0.0`.
+- `docs/ARCHITECTURE.md` examples referenced `3.0.0`.
+
+After 3.1.1:
+
+- `src/lacuna/__init__.py:__version__` is the **single source of truth**.
+- `pyproject.toml` reads it via `dynamic = ["version"]` /
+  `[tool.setuptools.dynamic]`.
+- `scripts/lint_versions.py` enforces that no other file hard-codes a
+  literal that disagrees.
+- All image tags, pipe pins, doc examples, and CHANGELOG references
+  show `3.1.1`.
+
+### Other reconciliations
+
+- `Dockerfile` no longer pins `LACUNA_MODEL_SONNET=claude-sonnet-4-5`;
+  it now matches the agent frontmatters' default of `claude-sonnet-4-6`.
+- `_collect_skeptic_reviews` in `reports/generator.py` now correctly
+  parses `payload_json` (the actual column) instead of the non-existent
+  `payload` key. The "Skeptic Reviews" report section is no longer
+  permanently empty.
+- `_collect_incomplete_fixes` now uses the real `hunter` column instead
+  of a non-existent `source_hunter` column, and looks up
+  per-hypothesis CWE / parent-commit metadata from `event_log` events
+  of type `incomplete_fix_metadata` when present.
+- `pre_compact_flush.py` no longer flushes draft tags that lack a
+  matching `assistant_turn` preamble; this closes the prompt-injection
+  hole where a DAST response body containing
+  `<hypothesis-draft>{...}</hypothesis-draft>` would be inserted into
+  the KG.
+- `pre_tool_use_gate.py` rate limit changed from "allow then sleep" to
+  "deny with retry-after". The in-flight call is no longer allowed
+  through when the bucket is empty.
+- `LACUNA_BUDGET_USD` now logs an explicit warning at scan start that
+  token-cost accounting is not yet implemented; the enforcement is a
+  documented no-op rather than a silent one.
+- `--dangerously-skip-permissions` now triggers a startup warning
+  that enumerates the consequence: the PreToolUse hook is the only
+  runtime gate; `permissions.allowedTools` in settings.json is
+  advisory under that flag.
+
 ## 3.1.0 — 2026-05-15
 
 ### Multi-model tiering
@@ -87,11 +139,11 @@ are not separately versioned.
   `triage-classifier`.
 * Skills under `.claude/skills/` for the researcher mindset
   (`vulnerability-researcher`, `interesting-input`, `trust-the-fuzzer`,
-  `read-the-fix`, `adversary-pricing`, `minimal-repro`,
-  `red-blue-dialectic`, `chain-construction`, `primitive-extraction`,
-  `poc-drafting`, `report-exec`, `report-tech`, `weird-machine`,
-  `trust-shadow-mapping`, `cross-hunter-observations`,
-  `semantic-pattern-matching`, `dast-orchestration`, `caveman`).
+  `adversary-pricing`, `minimal-repro`, `red-blue-dialectic`,
+  `chain-construction`, `primitive-extraction`, `poc-drafting`,
+  `report-exec`, `report-tech`, `weird-machine`,
+  `cross-hunter-observations`, `semantic-pattern-matching`,
+  `caveman`).
 
 **Knowledge graph.**
 

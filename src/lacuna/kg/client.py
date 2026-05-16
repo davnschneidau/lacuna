@@ -203,9 +203,96 @@ class KG:
     # ── lifecycle ───────────────────────────────────────────────────────────
 
     def initialize(self) -> None:
-        """Run schema. Called once at scan start."""
+        """Run schema. Called once at scan start.
+
+        The formal migrations framework in :mod:`lacuna.kg.migrations`
+        is the canonical source of schema changes. The legacy
+        ``_apply_additive_migrations`` shim is kept here for DBs that
+        pre-date the ``schema_migrations`` table; calling it after
+        ``apply_pending`` is harmless because every statement is
+        idempotent.
+        """
         schema = (resources.files("lacuna.kg") / "schema.sql").read_text()
         self._conn.executescript(schema)
+        self._conn.commit()
+        from .migrations import apply_pending
+        apply_pending(self._conn)
+        # Legacy compat shim — runs after the migrations framework so
+        # DBs that pre-date this module still pick up the additive
+        # columns. The migrations themselves are idempotent.
+        self._apply_additive_migrations()
+
+    def _apply_additive_migrations(self) -> None:
+        """Run idempotent additive ALTER TABLE statements.
+
+        Each statement is wrapped in a try/except — SQLite raises
+        ``OperationalError: duplicate column name`` when the column
+        already exists, which we silently swallow so the call is
+        idempotent across scan restarts.
+        """
+        additive = [
+            ("hypotheses", "scan_kind", "TEXT"),
+            ("findings", "scan_kind", "TEXT"),
+            ("primitives", "scan_kind", "TEXT"),
+            ("chains", "scan_kind", "TEXT"),
+        ]
+        for table, col, decl in additive:
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {col} {decl}"
+                )
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "duplicate column name" in msg or "no such table" in msg:
+                    continue
+                raise
+
+        # Adversary verdicts. The original skeptic emitted
+        # ``event_log`` rows of type ``skeptic_review`` -- durable, but
+        # not enumerable. The verdicts table makes "every finding has
+        # an adversary verdict before scan exit" an expressible
+        # invariant (the Stop hook joins ``findings`` to
+        # ``adversary_verdicts`` and refuses to finish if any are
+        # missing).
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS adversary_verdicts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                finding_id    TEXT NOT NULL REFERENCES findings(id),
+                adversary     TEXT NOT NULL,
+                verdict       TEXT NOT NULL CHECK (verdict IN (
+                                  'refute_pending',
+                                  'confirmed',
+                                  'downgrade',
+                                  'refuted',
+                                  'needs_human'
+                              )),
+                argument_for  TEXT,
+                argument_against TEXT,
+                reasoning     TEXT,
+                evidence_json TEXT,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_adv_finding
+                ON adversary_verdicts(finding_id, adversary);
+            CREATE TABLE IF NOT EXISTS chain_adversary_verdicts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_id      TEXT NOT NULL,
+                adversary     TEXT NOT NULL,
+                verdict       TEXT NOT NULL CHECK (verdict IN (
+                                  'refute_pending',
+                                  'confirmed',
+                                  'downgrade',
+                                  'refuted',
+                                  'needs_human'
+                              )),
+                reasoning     TEXT,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_chain_adv_chain
+                ON chain_adversary_verdicts(chain_id, adversary);
+            """
+        )
         self._conn.commit()
 
     def close(self) -> None:
@@ -261,15 +348,63 @@ class KG:
                 (summary_md, json.dumps(facts)),
             )
         self.set_exit_criterion("application_model_ready", met=True)
+        # Invalidate the read cache (see read_application_model).
+        self._application_model_cache = None
 
     def read_application_model(self) -> dict | None:
-        row = self._conn.execute("SELECT * FROM application_model LIMIT 1").fetchone()
+        """Return the application model with a per-instance cache.
+
+        Every report build calls this method 4-5 times (exec context,
+        tech context, repos count, chain context, app_name fallback)
+        and each call was hitting the DB plus JSON-decoding the facts
+        column. The cache makes repeated reads free; writes invalidate
+        it via :meth:`write_application_model`. The cache key is
+        ``True`` so ``None`` results are also cached (otherwise
+        pre-recon callers would keep paying for the round-trip).
+        """
+        cached = getattr(self, "_application_model_cache", None)
+        if cached is not None:
+            sentinel, value = cached
+            if sentinel:
+                return value
+        row = self._conn.execute(
+            "SELECT * FROM application_model LIMIT 1",
+        ).fetchone()
         if not row:
+            self._application_model_cache = (True, None)
             return None
-        return {
+        out = {
             "summary_md": row["summary_md"],
             "facts": json.loads(row["facts_json"]),
         }
+        self._application_model_cache = (True, out)
+        return out
+
+    def claim_idempotency_key(
+        self, key: str, table_name: str, row_id: str,
+    ) -> bool:
+        """Claim an idempotency key for a writer.
+
+        Returns True if the key was newly inserted (caller should
+        proceed with the write), False if it was already present
+        (caller should skip). Two callers:
+
+        - Hunters calling ``add_hypothesis`` with an explicit external
+          dedup key that's stronger than the (shape, repo, file,
+          line/5) dedup index (e.g. a payload hash).
+        - The harness re-claiming a known-seeded row after a
+          ``--resume`` restart.
+        """
+        try:
+            self._conn.execute(
+                "INSERT INTO idempotency_keys (key, table_name, row_id) "
+                "VALUES (?, ?, ?)",
+                (key, table_name, row_id),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
     # ── hypotheses ──────────────────────────────────────────────────────────
 
@@ -1227,6 +1362,104 @@ class KG:
             (agent, f"-{int(window_seconds)} seconds"),
         ).fetchone()
         return int(row["n"]) if row else 0
+
+    # ─── Phase 2: adversary verdicts ────────────────────────────────────────
+
+    def record_adversary_verdict(
+        self,
+        finding_id: str,
+        adversary: str,
+        verdict: str,
+        argument_for: str | None = None,
+        argument_against: str | None = None,
+        reasoning: str | None = None,
+        evidence: dict | None = None,
+    ) -> int:
+        """Persist one adversary verdict for a finding.
+
+        Multiple verdicts may be recorded for the same finding — for
+        instance the two-adversary mode records one verdict per
+        adversary. The Stop hook checks that *at least one* verdict
+        exists for every confirmed finding.
+        """
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO adversary_verdicts "
+                "(finding_id, adversary, verdict, argument_for, "
+                " argument_against, reasoning, evidence_json) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    finding_id, adversary, verdict, argument_for,
+                    argument_against, reasoning,
+                    json.dumps(evidence) if evidence else None,
+                ),
+            )
+        self.append_event(adversary, "adversary_verdict", {
+            "finding_id": finding_id,
+            "verdict": verdict,
+            "reasoning": (reasoning or "")[:500],
+        })
+        return int(cur.lastrowid or 0)
+
+    def list_adversary_verdicts(
+        self, finding_id: str | None = None,
+    ) -> list[dict]:
+        """Return all adversary verdicts, optionally filtered to one finding."""
+        if finding_id:
+            rows = self._conn.execute(
+                "SELECT * FROM adversary_verdicts "
+                "WHERE finding_id = ? ORDER BY id",
+                (finding_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM adversary_verdicts ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def findings_missing_adversary_verdict(self) -> list[str]:
+        """IDs of findings that have no verdict yet.
+
+        The Stop hook calls this and refuses the stop if any are
+        present. Every confirmed finding must have at least one
+        adversary verdict before the orchestrator can stop.
+        """
+        rows = self._conn.execute(
+            "SELECT f.id FROM findings f "
+            "LEFT JOIN adversary_verdicts v ON v.finding_id = f.id "
+            "GROUP BY f.id HAVING COUNT(v.id) = 0"
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def record_chain_adversary_verdict(
+        self,
+        chain_id: str,
+        adversary: str,
+        verdict: str,
+        reasoning: str | None = None,
+    ) -> int:
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO chain_adversary_verdicts "
+                "(chain_id, adversary, verdict, reasoning) "
+                "VALUES (?,?,?,?)",
+                (chain_id, adversary, verdict, reasoning),
+            )
+        return int(cur.lastrowid or 0)
+
+    def list_chain_adversary_verdicts(
+        self, chain_id: str | None = None,
+    ) -> list[dict]:
+        if chain_id:
+            rows = self._conn.execute(
+                "SELECT * FROM chain_adversary_verdicts "
+                "WHERE chain_id = ? ORDER BY id", (chain_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM chain_adversary_verdicts ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ─── v3: differential findings ──────────────────────────────────────────
 

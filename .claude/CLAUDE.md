@@ -159,9 +159,9 @@ to fuzz the candidate function. If a fuzzer crash returns matching the
 bug class, the verdict must NOT be `refuted` — see `trust-the-fuzzer`
 skill.
 
-### Phase 3.5 — Dynamic confirmation pass (v3, new)
+### Dynamic confirmation pass
 
-After Phase 3 has produced its first batch of validator results, spawn
+After validation has produced its first batch of validator results, spawn
 `fuzzing-coordinator` ONCE per scan. The coordinator:
 
 1. Reads `kg.read.precision_findings(unconsumed_only=true)` + active
@@ -183,7 +183,7 @@ After Phase 3 has produced its first batch of validator results, spawn
 The coordinator MUST stay under budget. Skipped targets get an event
 record so the next scan can resume.
 
-### Phase 3.6 — Variant hunting (v3, new)
+### Variant hunting
 
 When the validator confirms a finding (writes a `confirmed` verdict +
 minimal_repro), automatically spawn `variant-hunter` against that
@@ -197,22 +197,22 @@ finding. The variant-hunter:
 5. Links each child via `kg.write.variant_link(child_hyp_id,
    parent_finding_id)`.
 
-Child variants re-enter Phase 3 (validation) like any other hypothesis.
+Child variants re-enter validation like any other hypothesis.
 Empirically variants land 1.5-4× per parent confirmation. Hard cap at
 30 variants per parent to bound runaway.
 
-### Phase 3b — Incremental chain-building (continuous)
+### Incremental chain-building (continuous)
 
 Whenever ≥ 5 new primitives have been written since the last chain-builder
 run, spawn `chain-builder` again. This is fast — chains often emerge
-mid-scan, and finding them early enables Phase 3c.
+mid-scan, and finding them early enables speculative re-open.
 
-### Phase 3c — Speculative re-open (new in v2)
+### Speculative re-open
 
 When chain-building produces a candidate whose precondition is "attacker
 has X" (e.g. internal network access, leaked session, valid JWT for ANY
 user), re-trigger relevant hunters with that as a starting state. This is
-the loop the linear v1 architecture missed:
+the loop the linear architecture missed:
 
 ```
 chain-candidate: SSRF in api-svc → reaches internal-api as auth'd user
@@ -222,20 +222,27 @@ chain-candidate: SSRF in api-svc → reaches internal-api as auth'd user
 
 Cap: at most 2 re-opens per chain candidate, to bound runaway.
 
-### Phase 4 — Skeptic pass + reports
+### Adversarial review + reports
 
-1. Spawn the **skeptic** agent (Haiku). It re-reviews every confirmed
-   finding ≥ medium and emits a verdict (confirmed / downgrade / refuted /
-   needs_human). See the `skeptic` agent.
+1. Spawn the **adversary** agent (Haiku). It reviews every confirmed
+   finding with a default verdict of `refute_pending`; the finding must
+   defend itself before the adversary will flip the verdict to
+   `confirmed` / `downgrade` / `refuted` / `needs_human`. The Stop hook
+   refuses to finish the scan until every finding has at least one
+   adversary verdict (see `kg.findings_missing_adversary_verdict` and
+   `lacuna.hooks.stop_continuation`). Two-adversary mode adds an
+   independent `adversary-b`; disagreement promotes the finding to
+   `needs_human` regardless of which adversary was "right". Chains are
+   reviewed by `chain-adversary`; chain verdicts are recorded and
+   surfaced in the report but are not gated by the Stop hook.
 
-   **v3 addition:** if `kg.read.fuzz_crashes` returns a crash whose
-   `asan_kind` matches the finding's bug class, the skeptic verdict
-   cannot be `refuted` (downgrade still allowed). The crash is ground
-   truth.
+   If `kg.read.fuzz_crashes` returns a crash whose `asan_kind` matches
+   the finding's bug class, the adversary verdict cannot be `refuted`
+   (downgrade still allowed). The crash is ground truth.
 
 2. Generate reports. Invoke `report-exec` and `report-tech`. Or call
    `python3 -m lacuna report --reports-dir /reports`. Set
-   `reports_generated`. v3 reports include Known-Variant Clusters,
+   `reports_generated`. Reports include Known-Variant Clusters,
    Crash Reproductions, and Incomplete-Fix sections.
 
 3. Attempt to stop. The Stop hook checks:
@@ -244,23 +251,23 @@ Cap: at most 2 re-opens per chain candidate, to bound runaway.
    - all hypotheses resolved
    - chain search exhausted
    - every confirmed finding has a `minimal_repro`
-   - skeptic has reviewed every medium+ finding
-   - **v3**: no unreviewed high-severity `precision_findings`
+   - every confirmed finding has at least one adversary verdict
+   - no unreviewed high-severity `precision_findings`
    - `reports_generated`
 
 ### Parallelism rules (cheat sheet)
 
-| Phase | Concurrent unit | Cap |
+| Stage | Concurrent unit | Cap |
 |---|---|---|
-| 1 — Recon | per repo | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
-| 1b — Trust-shadow | 1 | n/a (single agent) |
-| 2 — Hunters | per (shape, repo) | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
-| 2b — Patch archaeology (v3) | per repo | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
-| 3 — Validators | per hypothesis | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
-| 3 — DAST | per distinct allowed_host | `LACUNA_MAX_PARALLEL_SUBAGENTS / 2` |
-| 3.5 — Fuzzing coordinator (v3) | 1 | n/a (single agent, internal parallelism) |
-| 3.6 — Variant hunter (v3) | per confirmed finding | `LACUNA_MAX_PARALLEL_SUBAGENTS / 2` |
-| 4 — Skeptic | per finding | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
+| Recon | per repo | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
+| Trust-shadow | 1 | n/a (single agent) |
+| Hunters | per (shape, repo) | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
+| Patch archaeology | per repo | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
+| Validators | per hypothesis | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
+| DAST | per distinct allowed_host | `LACUNA_MAX_PARALLEL_SUBAGENTS / 2` |
+| Fuzzing coordinator | 1 | n/a (single agent, internal parallelism) |
+| Variant hunter | per confirmed finding | `LACUNA_MAX_PARALLEL_SUBAGENTS / 2` |
+| Adversary review | per finding | `LACUNA_MAX_PARALLEL_SUBAGENTS` |
 
 ## Model tiering (cost/quality guide)
 
@@ -307,14 +314,13 @@ call a recon tool. When you need a judgment, spawn an agent.
 **Use the skills.** The `caveman` skill is your default style.
 Other skills (`semantic-pattern-matching`, `red-blue-dialectic`,
 `primitive-extraction`, `chain-construction`, `poc-drafting`,
-`report-exec`, `report-tech`, `dast-orchestration`) are invoked by name.
+`report-exec`, `report-tech`) are invoked by name.
 
-**New in v4 — Additional skills available:**
+**Additional skills available:**
 - `counterfactual-reasoning` — validator discipline: ask what would make this NOT a vuln
 - `inductive-variant-hunting` — variant-hunter propagation procedure
 - `patch-suggestion` — minimal correct patch after confirmation
 - `failing-test-generation` — regression test paired with patch
-- `threat-model-from-architecture` — derive threats from service topology
 
 **New in v4 — DAST tools available:**
 - `graphql_introspect(url)` — GraphQL schema + depth/batch tests

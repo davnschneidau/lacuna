@@ -1,6 +1,10 @@
 ---
 name: patch-suggestion
 description: After a finding is confirmed, generate a minimal, correct, and reviewable code patch. Use only after validator writes a confirmed verdict. Never suggest patches for unconfirmed hypotheses.
+when_to_use:
+  - Validator just wrote a confirmed verdict and a minimal repro is recorded.
+  - A reviewer asked for a remediation diff to accompany a finding in the tech report.
+  - You are preparing a fix-PR artefact (Phase 8) and need the patch as a starting point.
 ---
 
 # Patch suggestion
@@ -23,7 +27,7 @@ Never suggest patches for hypotheses or `needs_human` verdicts.
 ### Step 1 — Read the finding
 
 Extract from the confirmed finding:
-```
+```text
 SHAPE:    What class of vulnerability (sqli, ssrf, path_traversal, etc.)
 FILE:     The source file(s) containing the vulnerable code
 LINE:     The specific line(s) of the sink / missing check
@@ -106,12 +110,13 @@ rationale=..., test_hint=...)` with:
 
 ## Example output
 
-```
+```text
 Patch for fnd-abc (path traversal in upload_file):
 
 rationale: Path traversal occurs because user-supplied filename is joined
   to upload_dir without normalization. Fix: resolve the final path and
   assert it is still under upload_dir.
+```
 
 ```diff
 --- a/app/views/upload.py
@@ -127,6 +132,7 @@ rationale: Path traversal occurs because user-supplied filename is joined
          f.write(request.data)
 ```
 
+```text
 test_hint: Assert that a filename of "../../etc/passwd" returns 400
   and does not create a file outside UPLOAD_DIR.
 ```

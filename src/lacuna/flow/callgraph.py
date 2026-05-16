@@ -105,7 +105,7 @@ class CallGraph:
                 continue
             self._index_module(root, p, lang)
 
-        # Phase 2: resolve calls now that all functions are known.
+        # Resolution pass: now that all functions are known, resolve callees.
         for caller, calls in list(self.calls_by_function.items()):
             for cs in calls:
                 candidates = self._resolve_callee_candidates(

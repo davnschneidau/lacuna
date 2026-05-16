@@ -24,7 +24,7 @@ pipelines:
           services: [docker]
           size: 2x   # 8 GB / 2 vCPU; bump to 4x for very large apps
           script:
-            - pipe: docker://<your-registry>/lacuna:3.0.0
+            - pipe: docker://<your-registry>/lacuna:3.1.1
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'
@@ -46,7 +46,7 @@ pipelines:
           size: 4x
           deployment: staging
           script:
-            - pipe: docker://<your-registry>/lacuna:3.0.0
+            - pipe: docker://<your-registry>/lacuna:3.1.1
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast+dast'
@@ -75,7 +75,7 @@ pipelines:
           services: [docker]
           size: 2x
           script:
-            - pipe: docker://<your-registry>/lacuna:3.0.0
+            - pipe: docker://<your-registry>/lacuna:3.1.1
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'

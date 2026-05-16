@@ -15,6 +15,18 @@ to wrap in-flight artifacts in explicit tags:
     <next-actions>text</next-actions>
 
 The compaction prompt is best-effort. These tags are guaranteed.
+
+Security note. DAST tool results are attacker-controllable. A target
+that echoes ``<hypothesis-draft>{...}</hypothesis-draft>`` in an HTTP
+response body, error page, or reflected XSS payload would otherwise be
+silently written into the KG as a real hypothesis -- moving
+attacker-supplied bytes from the (untrusted) transcript region into a
+(trusted) durable knowledge surface. To close that gap, this hook
+requires draft tags to appear inside an explicit assistant region
+(``<assistant-draft>...</assistant-draft>``) and rejects drafts that
+appear inside any of the tool-result regions (``<tool-result>``,
+``<dast-response>``, etc.). The agent prompts emit the wrapper; the
+recon/DAST tool responses do not.
 """
 from __future__ import annotations
 
@@ -24,7 +36,6 @@ import re
 import sys
 import uuid
 
-# Make lacuna importable when hook is run from .claude/hooks/
 sys.path.insert(0, os.environ.get("LACUNA_SRC_ROOT", "/opt/lacuna/src"))
 
 from lacuna.kg import Hypothesis, Observation, Primitive, open_kg
@@ -42,12 +53,57 @@ NEXT_ACTIONS = re.compile(
     r"<next-actions>\s*(.*?)\s*</next-actions>", re.DOTALL
 )
 
+# Regions that contain *attacker-controlled* bytes. Anything inside one of
+# these blocks is untrusted and MUST NOT be promoted into the KG as a draft.
+UNTRUSTED_REGIONS = re.compile(
+    r"<(?:tool[-_]result|dast[-_]response|http[-_]response|user[-_]message)>"
+    r".*?"
+    r"</(?:tool[-_]result|dast[-_]response|http[-_]response|user[-_]message)>",
+    re.DOTALL,
+)
+
+# Regions that contain *agent-authored* bytes. Drafts MUST appear inside
+# one of these regions to be promoted. The agent prompts emit the wrapper
+# themselves; tools do not.
+TRUSTED_REGION = re.compile(
+    r"<(?:assistant[-_]draft|agent[-_]reasoning|orchestrator[-_]plan)>"
+    r"(.*?)"
+    r"</(?:assistant[-_]draft|agent[-_]reasoning|orchestrator[-_]plan)>",
+    re.DOTALL,
+)
+
 
 def _safe_json(s: str) -> dict | None:
     try:
         return json.loads(s)
     except json.JSONDecodeError:
         return None
+
+
+def _trusted_transcript(transcript: str) -> str:
+    """Return only the assistant-authored regions of the transcript.
+
+    Strategy: extract everything inside a trusted ``<assistant-draft>``
+    (or equivalent) block, *then* strip any nested untrusted region
+    that may have been quoted into it (e.g. when an agent quotes a
+    tool result for citation). The remaining text is the only safe
+    surface for promoting drafts into the KG.
+
+    Behaviour for legacy transcripts that don't use trusted wrappers
+    is governed by ``LACUNA_PRECOMPACT_REQUIRE_TRUSTED``:
+
+    - ``"1"`` (default) — drop drafts outside any trusted wrapper.
+    - ``"0"`` — fall back to the full transcript (legacy behaviour;
+      useful for migration of older scans, *not* recommended in DAST
+      mode).
+    """
+    pieces = [m.group(1) for m in TRUSTED_REGION.finditer(transcript)]
+    if not pieces:
+        if os.environ.get("LACUNA_PRECOMPACT_REQUIRE_TRUSTED", "1") == "0":
+            return UNTRUSTED_REGIONS.sub("", transcript)
+        return ""
+    cleaned = "\n".join(pieces)
+    return UNTRUSTED_REGIONS.sub("", cleaned)
 
 
 def main() -> int:
@@ -57,11 +113,28 @@ def main() -> int:
     except json.JSONDecodeError:
         hook_input = {}
 
-    transcript = hook_input.get("transcript", "")
+    raw_transcript = hook_input.get("transcript", "")
     agent_name = hook_input.get("agent", "orchestrator")
+    transcript = _trusted_transcript(raw_transcript)
 
     kg = open_kg()
-    flushed = {"hypotheses": 0, "primitives": 0, "chains": 0, "actions": 0}
+    flushed = {
+        "hypotheses": 0,
+        "primitives": 0,
+        "chains": 0,
+        "actions": 0,
+        "dropped_untrusted": 0,
+    }
+
+    # Account for any drafts that *would* have been promoted under the
+    # legacy "scan the whole transcript" behaviour but are now refused
+    # because they live in an untrusted region. The count is logged so
+    # the analyst can see when a target tried to inject drafts.
+    untrusted_only = UNTRUSTED_REGIONS.findall(raw_transcript)
+    if untrusted_only:
+        in_attacker_bytes = "\n".join(untrusted_only)
+        for pattern in (HYP_BLOCK, PRIM_BLOCK, CHAIN_BLOCK):
+            flushed["dropped_untrusted"] += len(pattern.findall(in_attacker_bytes))
 
     # 1. In-flight hypotheses
     for match in HYP_BLOCK.finditer(transcript):
@@ -151,8 +224,27 @@ def main() -> int:
     kg.append_event(
         agent_name,
         "compaction_checkpoint",
-        {"phase": "pre", "transcript_bytes": len(transcript), "flushed": flushed},
+        {
+            "phase": "pre",
+            "transcript_bytes": len(raw_transcript),
+            "trusted_bytes": len(transcript),
+            "flushed": flushed,
+        },
     )
+    if flushed["dropped_untrusted"]:
+        kg.append_event(
+            agent_name,
+            "precompact_injection_attempt",
+            {
+                "dropped_drafts": flushed["dropped_untrusted"],
+                "note": (
+                    "Draft tags appeared inside a tool/DAST response region "
+                    "and were refused. This is the expected behaviour when an "
+                    "attacker-controlled response echoes "
+                    "<hypothesis-draft>{...}</hypothesis-draft>."
+                ),
+            },
+        )
     kg.close()
 
     # Always allow the compaction to proceed

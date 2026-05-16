@@ -1,6 +1,10 @@
 ---
 name: inductive-variant-hunting
 description: After confirming one instance of a bug class, generate a propagation rule and systematically hunt for all sibling instances across the codebase. Use immediately after validator confirms a finding.
+when_to_use:
+  - Validator has just promoted a hypothesis to a confirmed finding.
+  - The variant-hunter agent has been dispatched and needs the propagation procedure.
+  - You suspect a bug class (not a single bug) and want to enumerate sibling sites.
 ---
 
 # Inductive variant hunting
@@ -26,14 +30,14 @@ Call this skill when:
 
 From the confirmed finding, extract exactly three things:
 
-```
+```text
 SOURCE:    What is the attacker-controlled input? (parameter name, type, path)
 SINK:      What is the dangerous function/method/call site?
 MISSING:   What sanitizer/check/guard is absent?
 ```
 
 Example:
-```
+```text
 SOURCE:    request.args.get("filename") — user-supplied string
 SINK:      os.path.join(upload_dir, filename) + open(path, "rb")
 MISSING:   Path traversal check (no normalization, no prefix assertion)
@@ -43,7 +47,7 @@ MISSING:   Path traversal check (no normalization, no prefix assertion)
 
 Abstract the site-specific details into a language-level pattern:
 
-```
+```text
 Rule: Any call to os.path.join() where one argument flows from
       request.{args,form,json,files} without intermediate normalization
       (Path.resolve(), os.path.abspath(), prefix check) is a candidate.
@@ -118,7 +122,7 @@ Hard cap: max 30 variants per parent finding to prevent runaway.
 
 ## Example output block
 
-```
+```xml
 <next-actions>
 Variant hunt complete for finding fnd-abc:
 - Propagation rule: os.path.join with user-supplied arg, no normalization

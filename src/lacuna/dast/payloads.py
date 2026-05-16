@@ -220,8 +220,3 @@ _PAYLOAD_INDEX = {
 
 def payloads_for_class(payload_class: str) -> list[str]:
     return _PAYLOAD_INDEX.get(payload_class.lower(), [])
-
-
-def replace_oob_token(payloads: list[str], token: str) -> list[str]:
-    """Replace OOB_TOKEN placeholders with an actual token."""
-    return [p.replace("OOB_TOKEN", token) for p in payloads]

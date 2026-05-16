@@ -4,6 +4,10 @@ description: |
   Default communication style for all Lacuna agents. Terse, decisive,
   fact-dense. No token budget concerns.
   What we cut is *ceremony*, not content.
+when_to_use:
+  - You are about to write any agent-to-KG note, hypothesis, finding, or report fragment.
+  - You catch yourself writing hedging phrases, preambles, or apologies.
+  - A reviewer notes that a draft is too verbose to scan quickly.
 ---
 
 # Caveman

@@ -41,7 +41,20 @@ def main() -> int:
     kg = open_kg()
     all_met, unmet = kg.all_exit_criteria_met()
 
-    if all_met:
+    # Every confirmed finding MUST have at least one adversary verdict
+    # before the orchestrator can stop. This makes the disprove-first
+    # sweep load-bearing: a scan that forgot to run it can't
+    # successfully exit.
+    missing_verdicts: list[str] = []
+    try:
+        missing_verdicts = kg.findings_missing_adversary_verdict()
+    except Exception:
+        # If the migration hasn't run yet (older KG), don't block —
+        # but the migration runs on initialize() so this should only
+        # happen during the very first call against an empty DB.
+        missing_verdicts = []
+
+    if all_met and not missing_verdicts:
         kg.append_event("orchestrator", "stop_allowed", {})
         kg.close()
         print(json.dumps({"decision": "allow"}))
@@ -51,8 +64,9 @@ def main() -> int:
     pending_count = status["hypotheses_pending"] + status["hypotheses_validating"]
     unexplored_prims = status["primitives_unexplored"]
 
-    # Build a directive that tells the orchestrator what's missing.
-    parts = [f"Exit criteria not yet met: {', '.join(unmet)}."]
+    parts: list[str] = []
+    if unmet:
+        parts.append(f"Exit criteria not yet met: {', '.join(unmet)}.")
     if pending_count:
         parts.append(
             f"{pending_count} hypotheses still pending or in validation."
@@ -67,12 +81,29 @@ def main() -> int:
             "Reports have not been written. Invoke the report-exec and "
             "report-tech skills."
         )
+    if missing_verdicts:
+        sample = ", ".join(missing_verdicts[:5])
+        more = (
+            f" (and {len(missing_verdicts) - 5} more)"
+            if len(missing_verdicts) > 5 else ""
+        )
+        parts.append(
+            f"{len(missing_verdicts)} confirmed finding(s) have no adversary "
+            f"verdict yet: {sample}{more}. Every finding must be reviewed "
+            f"by the adversary agent before the scan can stop. Spawn the "
+            f"`adversary` subagent on each, then re-attempt the stop."
+        )
     parts.append("Continue.")
 
     reason = " ".join(parts)
     kg.append_event(
         "orchestrator", "stop_blocked",
-        {"unmet": unmet, "reason": reason, "status": status},
+        {
+            "unmet": unmet,
+            "missing_verdicts": missing_verdicts,
+            "reason": reason,
+            "status": status,
+        },
     )
     kg.close()
 

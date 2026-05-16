@@ -1,6 +1,10 @@
 ---
 name: cross-hunter-observations
 description: Use the shared observation board to broadcast non-hypothesis facts to other hunters and to read facts discovered before you. Read at hunter start; write whenever you find something other hunters could use.
+when_to_use:
+  - A hunter agent is starting work and needs the shared context other hunters have already produced.
+  - A hunter discovers a fact (decoder location, secret format, framework idiom) that is not a hypothesis but would help peers.
+  - The orchestrator is deciding which hunter to dispatch next and wants the observation board summary.
 ---
 
 # Cross-hunter observations
@@ -29,7 +33,7 @@ Examples that are NOT observations (they're hypotheses or findings):
 ## When to READ observations
 
 At the start of every hunter run, call:
-```
+```python
 kg.read.observations(shape=YOUR_SHAPE)
 ```
 where YOUR_SHAPE is one of: `injection`, `authn-authz`, `crypto`,
@@ -91,7 +95,7 @@ can be longer with file:line evidence. `affects_shapes` is a list of
 hunter shapes that should see this on their next read.
 
 Example:
-```
+```python
 kg.write.observation(
   author_agent="hunter-authn-authz",
   kind="middleware_bypass",

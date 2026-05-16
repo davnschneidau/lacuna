@@ -1,0 +1,57 @@
+# Agent topology — which agents apply to which scan_kind.
+#
+# This file is the single source of truth for the SAST/DAST agent
+# partition.
+# ``scripts/lint_topology.py`` reads it and asserts:
+#
+# 1. Every agent definition under ``.claude/agents/*.md`` has an entry.
+# 2. Every entry's kind list is a subset of {sast, sast_dast}.
+# 3. Agents listed under ``dast_only`` do NOT appear under ``sast_only``
+#    and vice versa.
+# 4. The harness, when it picks the agent roster for a scan, only
+#    spawns agents whose kinds include the running scan_kind.
+#
+# Categories:
+#   shared        — applicable to every scan_kind. The orchestrator,
+#                   recon, triage classifier, and the cross-mode
+#                   adversaries live here.
+#   sast_only     — only spawn in SAST scans. Pure static-analysis
+#                   hunters that can't make use of a live target.
+#   dast_only     — only spawn in DAST scans. Runtime oracles, fuzzers,
+#                   browser-driven validators.
+#   either        — applicable to either kind. Most pattern-matching
+#                   hunters land here; the orchestrator routes the
+#                   findings appropriately.
+
+shared:
+  - recon
+  - triage-classifier
+  - skeptic
+  - adversary
+  - adversary-b
+  - chain-adversary
+  - validator
+  - chain-builder
+  - trust-shadow-analyzer
+
+sast_only:
+  - patch-archaeologist
+  - variant-hunter
+  - hunter-ci-supply-chain
+
+dast_only:
+  - fuzzing-coordinator
+
+either:
+  - hunter-authn-authz
+  - hunter-business-logic
+  - hunter-crypto
+  - hunter-cross-service
+  - hunter-deserialization
+  - hunter-graphql
+  - hunter-injection
+  - hunter-mass-assignment
+  - hunter-memory
+  - hunter-oauth
+  - hunter-race-toctou
+  - hunter-ssrf

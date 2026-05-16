@@ -5,6 +5,10 @@ description: |
   Encode the discipline of letting Layer-3 oracles override Layer-2
   analysis. Counterweights the validator failure mode where a confident
   static argument rationalizes away a real crash.
+when_to_use:
+  - Validator is about to refute a hypothesis despite a fuzzer crash on the same code.
+  - A fuzzer reported a hit and you are tempted to dismiss it as a known false positive.
+  - You see a disagreement between static reasoning and runtime evidence.
 ---
 
 # Trust the Fuzzer

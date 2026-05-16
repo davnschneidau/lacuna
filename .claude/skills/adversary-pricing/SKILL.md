@@ -4,6 +4,10 @@ description: |
   Would an actual attacker bother chaining this? Severity calibration that
   asks the economic question, not the theoretical one. Chain-builder uses
   it to prioritize; validator uses it to pick severity bands.
+when_to_use:
+  - Chain-builder is prioritizing which composed chains to surface first.
+  - Validator is choosing a severity band for a confirmed finding.
+  - Adversary is evaluating whether a refute_pending finding is economically realistic.
 ---
 
 # Adversary Pricing

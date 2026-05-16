@@ -1,6 +1,10 @@
 ---
 name: counterfactual-reasoning
 description: Ask "what would have to be true for this NOT to be a vulnerability?" before confirming or refuting any hypothesis. Use during validation to prevent both over-confirmation and over-refutation.
+when_to_use:
+  - Validator is one round away from confirming or refuting a hypothesis.
+  - Adversary is reviewing a finding under the disprove-first procedure.
+  - A hunter is tempted to mark a hypothesis confirmed without a PoC.
 ---
 
 # Counterfactual reasoning
@@ -86,7 +90,7 @@ Err toward `needs_human` rather than either false outcome.
 Hypothesis: SQL injection in `search_users(query)` via `request.args.get("q")`.
 
 **Before confirming:**
-```
+```text
 Refutation story 1: Framework parameterizes queries automatically.
   → Read: code_excerpt(search_users). Uses raw string formatting. DISCHARGED.
 
@@ -102,7 +106,7 @@ All stories discharged → confirm.
 ```
 
 **Before refuting (hypothetical different scenario):**
-```
+```text
 Confirmation story: There's a bypass for the allowlist check.
   → The allowlist checks for "SELECT" but not "SeLeCt". Bypass exists.
     CANNOT DISCHARGE → needs_human.
@@ -112,7 +116,7 @@ Confirmation story: There's a bypass for the allowlist check.
 
 When using this skill, emit your reasoning inline before the verdict:
 
-```
+```text
 Counterfactual check:
 - Refutation story 1 [mitigation type]: [discharged/not discharged — evidence]
 - Refutation story 2 [mitigation type]: [discharged/not discharged — evidence]

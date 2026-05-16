@@ -217,27 +217,6 @@ def _path_to_module(rel_path: str) -> str | None:
     return rel_path[:-3].replace("/", ".").replace("\\", ".")
 
 
-def load_scope_from_env() -> DiffScope | None:
-    """Load a DiffScope from LACUNA_DIFF_SCOPE_JSON env var. Returns None if not set."""
-    import os
-    raw = os.environ.get("LACUNA_DIFF_SCOPE_JSON")
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        scope = DiffScope(
-            base_ref=data.get("base_ref", ""),
-            head_ref=data.get("head_ref", ""),
-            repo_name=data.get("repo", ""),
-        )
-        scope.changed_files = data.get("changed_files", [])
-        scope.transitive_files = data.get("transitive_files", [])
-        scope.affected_handler_files = data.get("affected_handler_files", [])
-        return scope
-    except (json.JSONDecodeError, KeyError):
-        return None
-
-
 def _warn(msg: str) -> None:
     sys.stderr.write(f"[diff-scope] {msg}\n")
     sys.stderr.flush()

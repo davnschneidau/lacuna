@@ -5,6 +5,10 @@ description: |
   exploit (Red) and the strongest refutation (Blue) for each round, then
   reconciling. Up to 4 rounds. Between rounds, summarize-then-forget via
   agent_notes to keep context lean.
+when_to_use:
+  - Validator opens a hypothesis and starts the adjudication loop.
+  - A hypothesis was bounced back as needs_human and you are deciding whether to retry.
+  - You are about to confirm a hypothesis after only one round — slow down and run the dialectic.
 ---
 
 # Red/blue dialectic
@@ -76,7 +80,7 @@ Compare red and blue. One of:
 After each round, write a brief note (the validator-specific
 agent_notes path):
 
-```
+```python
 kg.memory.write(
   path="/memory/agent_notes/validator/<hypothesis_id>.md",
   content="""

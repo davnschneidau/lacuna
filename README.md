@@ -2,6 +2,8 @@
 
 > Agentic, multi-repo, application-level security scanner. Mythos-style behavior on top of Claude Code. SAST and DAST in one box. Runs as a Docker container — Bitbucket Cloud pipe or ad-hoc.
 
+**3.1.1** — version reconciliation across pyproject, pipe, image tags, docs. No behavior change vs 3.1.0; see CHANGELOG. The single source of truth for the version is `src/lacuna/__init__.py:__version__`; everything else reads it.
+
 **3.1.0** — cost-optimized specialist agents + risk timeline. New in this release:
 
 - **Multi-model tiering** reduces cost 3-4× with negligible quality loss:
@@ -46,7 +48,7 @@ It is built around four ideas, in order of importance:
 ```
 lacuna/
 ├── Dockerfile                # Container image, multi-stage
-├── pyproject.toml            # Python package (3.0.0)
+├── pyproject.toml            # Python package — version is dynamic, read from src/lacuna/__init__.py
 ├── CHANGELOG.md              # Version history
 ├── bitbucket-pipe/           # Bitbucket Pipe definition + entrypoint
 ├── src/lacuna/               # Python: KG, flow engine, MCP servers, oracles, hooks, harness, reports
@@ -62,7 +64,7 @@ lacuna/
 │   └── ...
 ├── .claude/                  # Claude Code config: CLAUDE.md, agents, skills, hooks, settings
 │   ├── agents/               # Hunters (injection, crypto, authn-authz, OAuth, mass-assignment, SSRF, GraphQL, business-logic, cross-service, deserialization, race-toctou, memory, CI-supply-chain) + recon + validator + chain-builder + skeptic + trust-shadow-analyzer + patch-archaeologist + variant-hunter + fuzzing-coordinator
-│   └── skills/               # Skills incl. weird-machine, trust-shadow-mapping, minimal-repro, cross-hunter-observations, vulnerability-researcher, trust-the-fuzzer, threat-model-from-architecture, inductive-variant-hunting, counterfactual-reasoning, patch-suggestion, failing-test-generation
+│   └── skills/               # Skills incl. weird-machine, minimal-repro, cross-hunter-observations, vulnerability-researcher, trust-the-fuzzer, inductive-variant-hunting, counterfactual-reasoning, patch-suggestion, failing-test-generation
 ├── examples/                 # Sample manifest + bitbucket-pipelines.yml
 ├── tests/                    # Unit tests for KG, hooks, MCP servers, flow engine
 └── docs/
@@ -120,7 +122,7 @@ pipelines:
           name: Lacuna application scan
           services: [docker]
           script:
-            - pipe: docker://your-registry/lacuna:3.1.0
+            - pipe: docker://your-registry/lacuna:3.1.1
               variables:
                 LACUNA_MANIFEST: 'app.lacuna.yaml'
                 LACUNA_MODE: 'sast'
@@ -190,12 +192,12 @@ v3 organizes its new capabilities into five layered modules:
 | 2 | `src/lacuna/precision/` | Precision static analysis: `integer_range`, `lifetime` (UAF), `format_string`, `type_confusion`, `allocator_map`. Output: `precision_findings` — high-confidence leads hunters convert into hypotheses. |
 | 3 | `src/lacuna/dynamic/` | Dynamic confirmation oracles: `sanitizer_build` (ASan/UBSan), `fuzzer` (libFuzzer harness wrapper + crash minimization), `symex` (angr subprocess), `differential` (multi-parser HTTP/URL/JSON oracle for smuggling and parser-confusion CVEs). |
 | 4 | `src/lacuna/patches/` | Patch-diff and variant search: `patch_essence` extracts the bug-class abstraction from a fix commit and generates a semgrep-style propagation rule; `propagate_pattern` runs it across the codebase to find sibling vulnerable sites. |
-| 5 | `.claude/skills/` | Researcher mindset, encoded: `vulnerability-researcher`, `interesting-input`, `trust-the-fuzzer`, `read-the-fix`, `adversary-pricing`. |
+| 5 | `.claude/skills/` | Researcher mindset, encoded: `vulnerability-researcher`, `interesting-input`, `trust-the-fuzzer`, `adversary-pricing`. |
 | Agents | `.claude/agents/` | Three new: `patch-archaeologist` (mines git history for incomplete fixes), `variant-hunter` (auto-spawned per confirmed finding), `fuzzing-coordinator` (decides what to fuzz under wall-clock budget). |
 
 ## Status
 
-Version 3.1.0. Production-shaped but expect rough edges. Some
+Version 3.1.1. Production-shaped but expect rough edges. Some
 oracles (libFuzzer, angr symex, ysoserial, sqlmap, gopherus, Playwright)
 are best-effort wrappers around external tooling — they fail loudly when
 their dependencies are missing rather than silently degrading. Issues,
